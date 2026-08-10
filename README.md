@@ -88,4 +88,13 @@ tests/          Sample video (git-lfs)
 
 ## License
 
-See `external/ffmpeg/LICENSE` for FFmpeg's licensing terms.
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+It is distributed as a combined work that links against GPL-3.0 FFmpeg, so
+the whole program is covered by GPL-3.0. Its dependencies carry their own
+licenses:
+
+- FFmpeg: GPL-3.0 (`external/ffmpeg/LICENSE`)
+- libplacebo: LGPL-2.1-or-later
+- SDL3: zlib license
+- Sample clip (`tests/`): Big Buck Bunny, CC-BY 3.0
