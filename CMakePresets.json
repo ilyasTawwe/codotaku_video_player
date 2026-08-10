@@ -1,0 +1,28 @@
+{
+    "version": 8,
+    "configurePresets": [
+        {
+            "name": "default",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "on"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "default-debug",
+            "configurePreset": "default",
+            "configuration": "Debug"
+        },
+        {
+            "name": "default-release",
+            "configurePreset": "default",
+            "configuration": "Release"
+        }
+    ]
+}

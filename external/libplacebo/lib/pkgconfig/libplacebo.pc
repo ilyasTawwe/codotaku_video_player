@@ -1,0 +1,23 @@
+prefix=C:/Users/taoua/libplacebo/dist
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+pl_has_d3d11=1
+pl_has_dovi=0
+pl_has_gl_proc_addr=1
+pl_has_glslang=0
+pl_has_lcms=0
+pl_has_libdovi=0
+pl_has_opengl=1
+pl_has_shaderc=1
+pl_has_vk_proc_addr=1
+pl_has_vulkan=1
+pl_has_xxhash=0
+
+Name: libplacebo
+Description: Reusable library for GPU-accelerated video/image rendering
+Version: 7.371.0
+Requires.private: shaderc >= 2019.1, spirv-cross-c-shared >= 0.29.0
+Libs: -L${libdir} -lplacebo
+Libs.private: -lshlwapi -lversion -LC:\VulkanSDK\1.4.357.0\Lib -lvulkan-1
+Cflags: -I${includedir}
