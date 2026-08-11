@@ -1,0 +1,3 @@
+[submodule "packs/Anime4K"]
+	path = packs/Anime4K
+	url = https://github.com/bloc97/Anime4K.git

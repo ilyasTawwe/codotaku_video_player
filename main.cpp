@@ -10,6 +10,8 @@
 #include <source_location>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 extern "C" {
 #include <libavutil/dict.h>
@@ -26,6 +28,7 @@ extern "C" {
 #include <libplacebo/gpu.h>
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
+#include <libplacebo/shaders/custom.h>
 #include <libplacebo/swapchain.h>
 #define PL_LIBAV_IMPLEMENTATION 0
 #include <libplacebo/utils/libav.h>
@@ -75,6 +78,9 @@ struct App {
   pl_renderer renderer;
   Player player;
   pl_tex frame_tex[4]{};
+  // User shaders (mpv-style .glsl/.hook packs) parsed with
+  // pl_mpv_user_shader_parse; owned and destroyed on quit.
+  std::vector<const pl_hook *> hooks;
   SDL_AudioStream *audio_stream = nullptr;
 
   // FPS counter: rendered frames within a rolling ~2s logging window.
@@ -296,7 +302,52 @@ auto create_swapchain(App &app) -> void {
         "pl_renderer_create failed; see the log above for details");
 }
 
-auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
+// Load an mpv-style user shader (e.g. Anime4K / RAVU packs) and register its
+// hooks for the compositor. Prints any tunable parameters it exports.
+auto load_shader(App &app, const char *path) -> bool {
+  FILE *f = nullptr;
+#ifdef _WIN32
+  if (fopen_s(&f, path, "rb") != 0)
+    f = nullptr;
+#else
+  f = fopen(path, "rb");
+#endif
+  if (f == nullptr) {
+    std::println(stderr, "could not open shader: {}", path);
+    return false;
+  }
+  std::string text;
+  char buf[8192];
+  for (size_t n = fread(buf, 1, sizeof(buf), f); n > 0;
+       n = fread(buf, 1, sizeof(buf), f))
+    text.append(buf, n);
+  fclose(f);
+
+  const pl_hook *hook =
+      pl_mpv_user_shader_parse(app.gpu, text.c_str(), text.size());
+  if (hook == nullptr) {
+    std::println(stderr, "failed to parse shader: {}", path);
+    return false;
+  }
+  app.hooks.push_back(hook);
+  std::println("shader: {} ({} tunable parameter(s))", path,
+               hook->num_parameters);
+  for (int i = 0; i < hook->num_parameters; i++) {
+    const pl_hook_par *par = &hook->parameters[i];
+    std::println("  {}: {}", par->name,
+                 par->description != nullptr ? par->description : "");
+  }
+  return true;
+}
+
+// Composite a decoded frame into an already-resolved target frame (e.g. the
+// current swapchain FBO). This is the seam between compositing and
+// presentation: everything libplacebo needs is passed as data, so the same
+// call can later drive offscreen targets for export. The target's crop must
+// span the full output area; it is replaced with the aspect-corrected video
+// rect here.
+auto composite_frame(App &app, AVFrame *frame, pl_frame *target,
+                     const struct pl_render_params *params) -> bool {
   struct pl_frame pic {};
   struct pl_avframe_params map_params = {
       .frame = frame,
@@ -305,13 +356,22 @@ auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
   };
   if (!pl_map_avframe_ex(app.gpu, &pic, &map_params)) {
     std::println(stderr, "pl_map_avframe failed");
-    return SDL_APP_FAILURE;
+    return false;
   }
 
+  pl_rect2df_aspect_copy(&target->crop, &pic.crop, 0.5f);
+
+  bool ok = pl_render_image(app.renderer, &pic, target, params);
+  pl_unmap_avframe(app.gpu, &pic);
+  if (!ok)
+    std::println(stderr, "pl_render_image failed");
+  return ok;
+}
+
+auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
   struct pl_swapchain_frame sw {};
   if (!pl_swapchain_start_frame(app.swapchain, &sw)) {
     std::println(stderr, "pl_swapchain_start_frame failed");
-    pl_unmap_avframe(app.gpu, &pic);
     return SDL_APP_CONTINUE;
   }
 
@@ -323,18 +383,15 @@ auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
   pl_frame_from_swapchain(&target, &sw);
   target.crop = {0, 0, static_cast<float>(sw.fbo->params.w),
                  static_cast<float>(sw.fbo->params.h)};
-  pl_rect2df_aspect_copy(&target.crop, &pic.crop, 0.5f);
 
   struct pl_render_params params = pl_render_default_params;
   params.upscaler = &pl_filter_spline36;
   params.downscaler = &pl_filter_spline36;
+  params.hooks = app.hooks.empty() ? nullptr : app.hooks.data();
+  params.num_hooks = static_cast<int>(app.hooks.size());
 
-  if (!pl_render_image(app.renderer, &pic, &target, &params)) {
-    std::println(stderr, "pl_render_image failed");
-    pl_unmap_avframe(app.gpu, &pic);
+  if (!composite_frame(app, frame, &target, &params))
     return SDL_APP_FAILURE;
-  }
-  pl_unmap_avframe(app.gpu, &pic);
 
   if (!pl_swapchain_submit_frame(app.swapchain)) {
     std::println(stderr, "pl_swapchain_submit_frame failed");
@@ -440,8 +497,24 @@ auto SDL_AppInit(void **appstate, int argc, char **argv) -> SDL_AppResult try {
   create_vulkan(*app);
   create_swapchain(*app);
 
-  const char *path = argc > 1 ? argv[1] : CODOTAKU_DEFAULT_VIDEO_PATH;
-  app->player.open(path, app->hwdev);
+  constexpr std::string_view kShaderFlag = "--shader=";
+  std::string video_path = CODOTAKU_DEFAULT_VIDEO_PATH;
+  for (int i = 1; i < argc; i++) {
+    std::string_view arg = argv[i];
+    if (arg == "--shader") {
+      if (i + 1 >= argc)
+        throw std::runtime_error("--shader requires a file path");
+      if (!load_shader(*app, argv[++i]))
+        throw std::runtime_error(std::format("failed to load shader: {}", argv[i]));
+    } else if (arg.starts_with(kShaderFlag)) {
+      std::string shader_path(arg.substr(kShaderFlag.size()));
+      if (!load_shader(*app, shader_path.c_str()))
+        throw std::runtime_error(std::format("failed to load shader: {}", shader_path));
+    } else {
+      video_path = argv[i];
+    }
+  }
+  app->player.open(video_path.c_str(), app->hwdev);
   const PlayerInfo &info = app->player.info();
   std::println("opened: {}x{}, {} decoder, hwaccel: {}",
                info.width, info.height, info.codec_name,
@@ -462,6 +535,9 @@ auto SDL_AppInit(void **appstate, int argc, char **argv) -> SDL_AppResult try {
                  info.audio_channels, info.audio_sample_rate, dst.channels,
                  dst.freq, app->audio_out_bytes_per_sec);
   }
+  // Flush init logs so they are visible even if the process is killed or
+  // crashes mid-playback (stdout is block-buffered when redirected).
+  std::fflush(stdout);
 
   clock_set_at(app->wall, 0.0, 0, now_s());
   chk(SDL_ShowWindow(app->window));
@@ -630,6 +706,9 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) try {
     SDL_DestroyAudioStream(app->audio_stream);
   if (app->renderer != nullptr)
     pl_renderer_destroy(&app->renderer);
+  for (const pl_hook *hook : app->hooks)
+    pl_mpv_user_shader_destroy(&hook);
+  app->hooks.clear();
   if (app->gpu != nullptr)
     for (auto &tex : app->frame_tex)
       pl_tex_destroy(app->gpu, &tex);
