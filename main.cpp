@@ -81,6 +81,7 @@ struct App {
   // User shaders (mpv-style .glsl/.hook packs) parsed with
   // pl_mpv_user_shader_parse; owned and destroyed on quit.
   std::vector<const pl_hook *> hooks;
+  bool shaders_enabled = true;  // toggled at runtime with the 's' key
   SDL_AudioStream *audio_stream = nullptr;
 
   // FPS counter: rendered frames within a rolling ~2s logging window.
@@ -387,8 +388,10 @@ auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
   struct pl_render_params params = pl_render_default_params;
   params.upscaler = &pl_filter_spline36;
   params.downscaler = &pl_filter_spline36;
-  params.hooks = app.hooks.empty() ? nullptr : app.hooks.data();
-  params.num_hooks = static_cast<int>(app.hooks.size());
+  if (app.shaders_enabled) {
+    params.hooks = app.hooks.empty() ? nullptr : app.hooks.data();
+    params.num_hooks = static_cast<int>(app.hooks.size());
+  }
 
   if (!composite_frame(app, frame, &target, &params))
     return SDL_APP_FAILURE;
@@ -674,9 +677,9 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       pl_swapchain_resize(app->swapchain, &w, &h);
     break;
   }
-  case SDL_EVENT_KEY_DOWN:
+  case SDL_EVENT_KEY_DOWN: {
+    auto *app = static_cast<App *>(appstate);
     if (event->key.key == SDLK_SPACE) {
-      auto *app = static_cast<App *>(appstate);
       app->paused = !app->paused;
       // Freeze the video clock while paused so it doesn't keep drifting with
       // wall time; re-prime pacing when playback resumes.
@@ -689,8 +692,18 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
           SDL_ResumeAudioStreamDevice(app->audio_stream);
       }
       std::println("{}", app->paused ? "paused" : "playing");
+    } else if (event->key.key == SDLK_S) {
+      if (app->hooks.empty()) {
+        std::println(stderr,
+                     "no shaders loaded; start with --shader <file>");
+      } else {
+        app->shaders_enabled = !app->shaders_enabled;
+        std::println(stderr, "shaders: {} ({} loaded)",
+                     app->shaders_enabled ? "on" : "off", app->hooks.size());
+      }
     }
     break;
+  }
   default:
     return SDL_APP_CONTINUE;
   }
