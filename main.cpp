@@ -69,10 +69,9 @@ struct App {
   pl_tex frame_tex[4]{};
   SDL_AudioStream *audio_stream = nullptr;
 
-  // Playback clock. `base_pts_us` is the PTS (us) of the first displayed
-  // frame, anchored to `base_clock_ns` in SDL monotonic time.
-  int64_t base_pts_us = AV_NOPTS_VALUE;
-  Uint64 base_clock_ns = 0;
+  // FPS counter: rendered frames within a rolling ~2s logging window.
+  Uint64 fps_log_ns = 0;
+  Uint64 fps_frames = 0;
   bool paused = false;
 };
 
@@ -182,7 +181,7 @@ auto create_swapchain(App &app) -> void {
 
   struct pl_vulkan_swapchain_params params = {
       .surface = app.surface,
-      .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+      .present_mode = VK_PRESENT_MODE_MAILBOX_KHR,
   };
   app.swapchain = pl_vulkan_create_swapchain(app.vk, &params);
   if (app.swapchain == nullptr)
@@ -200,12 +199,6 @@ auto create_swapchain(App &app) -> void {
   if (app.renderer == nullptr)
     throw std::runtime_error(
         "pl_renderer_create failed; see the log above for details");
-}
-
-auto frame_pts_us(const AVFrame *frame, const Player &player) -> int64_t {
-  if (frame->pts == AV_NOPTS_VALUE)
-    return AV_NOPTS_VALUE;
-  return av_rescale_q(frame->pts, player.time_base(), AV_TIME_BASE_Q);
 }
 
 auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
@@ -377,29 +370,27 @@ auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
       app->player.rewind();
       if (app->audio_stream != nullptr)
         SDL_ClearAudioStream(app->audio_stream);
-      app->base_pts_us = AV_NOPTS_VALUE;
       frame = app->player.next_frame();
     }
     if (frame == nullptr)
       return SDL_APP_SUCCESS;
   }
 
-  // Pace playback against the wall clock so decoding stays in real time.
-  int64_t pts_us = frame_pts_us(frame, app->player);
-  if (app->base_pts_us == AV_NOPTS_VALUE) {
-    app->base_pts_us = pts_us;
-    app->base_clock_ns = SDL_GetTicksNS();
-  }
-  if (pts_us != AV_NOPTS_VALUE && app->base_pts_us != AV_NOPTS_VALUE) {
-    int64_t now_us =
-        static_cast<int64_t>(SDL_GetTicksNS() - app->base_clock_ns) / 1000;
-    int64_t wait_us = pts_us - (app->base_pts_us + now_us);
-    if (wait_us > 0 && wait_us < 1'000'000)
-      SDL_Delay(static_cast<Uint32>(wait_us / 1000));
-  }
-
   SDL_AppResult result = render_frame(*app, frame);
   av_frame_free(&frame);
+
+  // Log the render throughput every ~2 seconds.
+  app->fps_frames++;
+  Uint64 now_ns = SDL_GetTicksNS();
+  if (app->fps_log_ns == 0)
+    app->fps_log_ns = now_ns;
+  double elapsed_s =
+      static_cast<double>(now_ns - app->fps_log_ns) / SDL_NS_PER_SECOND;
+  if (elapsed_s >= 2.0) {
+    std::println(stderr, "fps: {:.1f}", app->fps_frames / elapsed_s);
+    app->fps_log_ns = now_ns;
+    app->fps_frames = 0;
+  }
   return result;
 } catch (const std::exception &e) {
   std::println(stderr, "{}", e.what());
