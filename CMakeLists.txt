@@ -110,4 +110,20 @@ if(WIN32)
         "$<TARGET_FILE_DIR:codotaku_video_player>"
         COMMENT "Copying SDL3.dll to output directory..."
     )
+
+    # Copy each pack's mpv-style shaders next to the exe so the build output is
+    # self-contained. Only the glsl subfolder is needed at runtime; the full
+    # Anime4K checkout is ~285MB of models/experiments.
+    file(GLOB PACK_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/packs/*")
+    foreach(PACK_DIR ${PACK_DIRS})
+        get_filename_component(PACK_NAME "${PACK_DIR}" NAME)
+        if(EXISTS "${PACK_DIR}/glsl")
+            add_custom_command(TARGET codotaku_video_player POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${PACK_DIR}/glsl"
+                "$<TARGET_FILE_DIR:codotaku_video_player>/packs/${PACK_NAME}/glsl"
+                COMMENT "Copying ${PACK_NAME} shaders to output directory..."
+            )
+        endif()
+    endforeach()
 endif()
