@@ -312,10 +312,11 @@ void Player::demux_loop() {
       break;
     }
   }
-  // Receivers drain the queues, then see AVERROR_EOF on recv.
-  av_thread_message_queue_set_err_send(video_q_, AVERROR_EOF);
+  // Receivers drain the queues, then see AVERROR_EOF on recv. recv() only
+  // wakes on err_recv/cond_recv, so set the receiver error, not just err_send.
+  av_thread_message_queue_set_err_recv(video_q_, AVERROR_EOF);
   if (audio_q_ != nullptr)
-    av_thread_message_queue_set_err_send(audio_q_, AVERROR_EOF);
+    av_thread_message_queue_set_err_recv(audio_q_, AVERROR_EOF);
 }
 
 void Player::audio_decode_loop() {

@@ -85,7 +85,7 @@ struct App {
   // wired up in later milestones.
   Uint64 sync_log_ns = 0;
   MediaClock vidclk;
-  MediaClock wall;   // set to 0 at startup; verifies the clock primitive
+  MediaClock wall;   // external/wall clock: master for files without audio
   double sync_delay = NAN;   // delay used for the last displayed frame
   int frame_drops = 0;
   Uint64 audio_frames = 0;
@@ -572,11 +572,10 @@ auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
     double video = clock_get(app->vidclk);
     std::println(stderr,
                  "sync: master={} video={} avdiff={:+.0f}ms delay={} "
-                 "drops={} aqueue={} afps={:.0f} wall={}",
+                 "drops={} aqueue={} afps={:.0f}",
                  fmt_clock(master), fmt_clock(video),
                  (video - master) * 1000.0, fmt_clock(app->sync_delay),
-                 app->frame_drops, app->player.audio_queue_depth(), afps,
-                 fmt_clock(clock_get(app->wall)));
+                 app->frame_drops, app->player.audio_queue_depth(), afps);
     app->audio_frames_prev = app->audio_frames;
     app->sync_log_ns = sync_now_ns;
   }
