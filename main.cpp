@@ -481,42 +481,61 @@ auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
 
   drain_audio(*app);
 
-  AVFrame *frame = app->player.next_frame();
-  if (frame == nullptr) {
-    if (app->player.eof()) {
-      app->player.rewind();
-      if (app->audio_stream != nullptr)
-        SDL_ClearAudioStream(app->audio_stream);
-      app->audio_pts_end = 0.0;
-      app->frame_timer = 0.0; // re-primed below on the first frame
-      app->prev_frame_pts = NAN;
-      app->vidclk = MediaClock{};
-      frame = app->player.next_frame();
+  double frame_pts = NAN;
+  AVFrame *frame = nullptr;
+  for (;;) {
+    frame = app->player.next_frame();
+    if (frame == nullptr) {
+      if (app->player.eof()) {
+        app->player.rewind();
+        if (app->audio_stream != nullptr)
+          SDL_ClearAudioStream(app->audio_stream);
+        app->audio_pts_end = 0.0;
+        app->frame_timer = 0.0; // re-primed below on the first frame
+        app->prev_frame_pts = NAN;
+        app->vidclk = MediaClock{};
+        frame = app->player.next_frame();
+      }
+      if (frame == nullptr)
+        return SDL_APP_SUCCESS;
     }
-    if (frame == nullptr)
-      return SDL_APP_SUCCESS;
+
+    // How long this frame should be displayed, corrected toward the master
+    // (audio) clock.
+    frame_pts = frame_pts_s(app->player, frame);
+    double nominal_duration =
+        app->player.info().fps > 0.0 ? 1.0 / app->player.info().fps : 1.0 / 60.0;
+    double duration =
+        frame_duration(app->prev_frame_pts, frame_pts, nominal_duration);
+    double delay = compute_target_delay(duration, *app);
+    app->sync_delay = delay;
+
+    double time = now_s();
+    if (app->frame_timer == 0.0)
+      app->frame_timer = time;
+
+    // Drop a frame that is already overdue: displaying it now would keep the
+    // video clock stuck behind the audio master. Skipping frames (advancing
+    // frame_timer as if it were shown) lets video catch up instead of
+    // accumulating drift. Never drop at EOF so the tail always renders.
+    if (time > app->frame_timer + duration && !app->player.eof()) {
+      app->frame_drops++;
+      app->frame_timer += delay;
+      if (app->frame_timer < time - kSyncThresholdMax)
+        app->frame_timer = time;
+      av_frame_free(&frame);
+      continue;
+    }
+
+    // Wait until the frame is due (ffplay frame_timer pacing).
+    if (time < app->frame_timer + delay)
+      SDL_Delay(static_cast<int>((app->frame_timer + delay - time) * 1000.0));
+    time = now_s();
+    app->frame_timer += delay;
+    if (delay > 0.0 && time - app->frame_timer > kSyncThresholdMax)
+      app->frame_timer = time;
+    break;
   }
-
-  // How long this frame should be displayed, corrected toward the master
-  // (audio) clock.
-  double frame_pts = frame_pts_s(app->player, frame);
-  double nominal_duration =
-      app->player.info().fps > 0.0 ? 1.0 / app->player.info().fps : 1.0 / 60.0;
-  double duration =
-      frame_duration(app->prev_frame_pts, frame_pts, nominal_duration);
-  double delay = compute_target_delay(duration, *app);
-  app->sync_delay = delay;
-
-  // Wait until the frame is due (ffplay frame_timer pacing).
-  double time = now_s();
-  if (app->frame_timer == 0.0)
-    app->frame_timer = time;
-  if (time < app->frame_timer + delay)
-    SDL_Delay(static_cast<int>((app->frame_timer + delay - time) * 1000.0));
-  time = now_s();
-  app->frame_timer += delay;
-  if (delay > 0.0 && time - app->frame_timer > kSyncThresholdMax)
-    app->frame_timer = time;
 
   SDL_AppResult result = render_frame(*app, frame);
 
@@ -584,6 +603,10 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
     if (event->key.key == SDLK_SPACE) {
       auto *app = static_cast<App *>(appstate);
       app->paused = !app->paused;
+      // Freeze the video clock while paused so it doesn't keep drifting with
+      // wall time; re-prime pacing when playback resumes.
+      app->vidclk.paused = app->paused;
+      app->frame_timer = 0.0;
       if (app->audio_stream != nullptr) {
         if (app->paused)
           SDL_PauseAudioStreamDevice(app->audio_stream);
