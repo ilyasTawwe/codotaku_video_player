@@ -18,9 +18,15 @@ auto av_err_str(int err) -> std::string {
   return buf;
 }
 
-// Demuxed packets are pushed onto this queue, which gives the demux thread
+// Demuxed packets are pushed onto these queues, which gives the demux thread
 // natural backpressure so it can't run arbitrarily far ahead of playback.
-constexpr unsigned kDemuxQueueDepth = 128;
+// The video queue is deeper than the audio queue: audio is delivered on a
+// first-priority blocking send, while a deep video queue absorbs transient
+// decode/display stalls without the demux thread blocking on it.
+constexpr unsigned kVideoQueueDepth = 512;
+constexpr unsigned kAudioQueueDepth = 128;
+// Decoded audio frames are handed to the main thread through this queue.
+constexpr unsigned kAudioFrameQueueDepth = 32;
 
 [[noreturn]] auto throw_av(int err,
                            std::source_location loc =
@@ -39,22 +45,26 @@ int Player::demux_interrupt_cb(void *opaque) {
 }
 
 void Player::close() {
-  // Abort the demux thread and wake any blocked send/recv on the queue.
+  // Abort the demux thread and wake any blocked send/recv on the queues. The
+  // err_send on audio_frame_q_ also unblocks a pending send in the audio
+  // thread that would otherwise wait for the main thread to drain it.
   interrupt_.abort = 1;
-  if (packet_q_ != nullptr) {
-    av_thread_message_queue_set_err_send(packet_q_, AVERROR_EXIT);
-    av_thread_message_queue_set_err_recv(packet_q_, AVERROR_EXIT);
+  for (AVThreadMessageQueue *q : {video_q_, audio_q_, audio_frame_q_}) {
+    if (q == nullptr)
+      continue;
+    av_thread_message_queue_set_err_send(q, AVERROR_EXIT);
+    av_thread_message_queue_set_err_recv(q, AVERROR_EXIT);
   }
   stop_demux();
+  stop_adec();
 
-  if (packet_q_ != nullptr) {
-    av_thread_message_flush(packet_q_);
-    av_thread_message_queue_free(&packet_q_);
+  for (AVThreadMessageQueue **q : {&video_q_, &audio_q_, &audio_frame_q_}) {
+    if (*q == nullptr)
+      continue;
+    av_thread_message_flush(*q);
+    av_thread_message_queue_free(q);
   }
 
-  for (AVFrame *af : audio_queue_)
-    av_frame_free(&af);
-  audio_queue_.clear();
   avcodec_free_context(&adec_);
   av_packet_free(&pending_pkt_);
   avcodec_free_context(&dec_);
@@ -139,6 +149,7 @@ void Player::open_audio() {
   info_.has_audio = true;
   info_.audio_sample_rate = adec_->sample_rate;
   info_.audio_channels = adec_->ch_layout.nb_channels;
+  info_.audio_time_base = st->time_base;
 }
 
 void Player::open(const char *path, AVBufferRef *hwdev) {
@@ -174,11 +185,11 @@ void Player::open(const char *path, AVBufferRef *hwdev) {
   if (pending_pkt_ == nullptr)
     throw std::bad_alloc();
 
-  int qr = av_thread_message_queue_alloc(&packet_q_, kDemuxQueueDepth,
+  int qr = av_thread_message_queue_alloc(&video_q_, kVideoQueueDepth,
                                          sizeof(AVPacket *));
   if (qr < 0)
     throw_av(qr);
-  av_thread_message_queue_set_free_func(packet_q_, [](void *msg) {
+  av_thread_message_queue_set_free_func(video_q_, [](void *msg) {
     av_packet_free(reinterpret_cast<AVPacket **>(msg));
   });
 
@@ -203,23 +214,47 @@ void Player::open(const char *path, AVBufferRef *hwdev) {
 
   open_audio();
 
+  if (info_.has_audio) {
+    int aq = av_thread_message_queue_alloc(&audio_q_, kAudioQueueDepth,
+                                           sizeof(AVPacket *));
+    if (aq < 0)
+      throw_av(aq);
+    av_thread_message_queue_set_free_func(audio_q_, [](void *msg) {
+      av_packet_free(reinterpret_cast<AVPacket **>(msg));
+    });
+
+    int fq = av_thread_message_queue_alloc(&audio_frame_q_, kAudioQueueDepth,
+                                           sizeof(AVFrame *));
+    if (fq < 0)
+      throw_av(fq);
+    av_thread_message_queue_set_free_func(audio_frame_q_, [](void *msg) {
+      av_frame_free(reinterpret_cast<AVFrame **>(msg));
+    });
+  }
+
   info_.width = st->codecpar->width;
   info_.height = st->codecpar->height;
   info_.time_base = st->time_base;
   info_.codec_name = codec->name;
+  if (st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0)
+    info_.fps = av_q2d(st->avg_frame_rate);
+  else if (st->r_frame_rate.num > 0 && st->r_frame_rate.den > 0)
+    info_.fps = av_q2d(st->r_frame_rate);
   if (st->duration != AV_NOPTS_VALUE)
     info_.duration_us =
         av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
 
   start_demux();
+  if (info_.has_audio)
+    start_adec();
 }
 
 void Player::start_demux() {
   interrupt_.abort = 0;
   demux_eof_ = false;
-  if (packet_q_ != nullptr) {
-    av_thread_message_queue_set_err_send(packet_q_, 0);
-    av_thread_message_queue_set_err_recv(packet_q_, 0);
+  if (video_q_ != nullptr) {
+    av_thread_message_queue_set_err_send(video_q_, 0);
+    av_thread_message_queue_set_err_recv(video_q_, 0);
   }
   if (demux_thread_.joinable())
     stop_demux();
@@ -229,6 +264,23 @@ void Player::start_demux() {
 void Player::stop_demux() {
   if (demux_thread_.joinable())
     demux_thread_.join();
+}
+
+void Player::start_adec() {
+  if (audio_q_ == nullptr || audio_frame_q_ == nullptr)
+    return;
+  av_thread_message_queue_set_err_send(audio_q_, 0);
+  av_thread_message_queue_set_err_recv(audio_q_, 0);
+  av_thread_message_queue_set_err_send(audio_frame_q_, 0);
+  av_thread_message_queue_set_err_recv(audio_frame_q_, 0);
+  if (adec_thread_.joinable())
+    stop_adec();
+  adec_thread_ = std::thread(&Player::audio_decode_loop, this);
+}
+
+void Player::stop_adec() {
+  if (adec_thread_.joinable())
+    adec_thread_.join();
 }
 
 void Player::demux_loop() {
@@ -243,15 +295,47 @@ void Player::demux_loop() {
       av_packet_free(&raw);
       break;
     }
-    // Blocking send applies backpressure; the pointer ownership transfers.
-    int sr = av_thread_message_queue_send(packet_q_, &raw, 0);
+    // Blocking sends apply backpressure; the pointer ownership transfers.
+    // Video uses a deep queue so the demux thread keeps reading audio even
+    // while the display stalls, and audio always gets its packet.
+    int sr = 0;
+    if (raw->stream_index == stream_) {
+      sr = av_thread_message_queue_send(video_q_, &raw, 0);
+    } else if (raw->stream_index == audio_stream_) {
+      sr = av_thread_message_queue_send(audio_q_, &raw, 0);
+    } else {
+      av_packet_free(&raw);
+      continue;
+    }
     if (sr < 0) {
       av_packet_free(&raw);
       break;
     }
   }
-  // Receivers drain the queue, then see AVERROR_EOF on recv.
-  av_thread_message_queue_set_err_send(packet_q_, AVERROR_EOF);
+  // Receivers drain the queues, then see AVERROR_EOF on recv.
+  av_thread_message_queue_set_err_send(video_q_, AVERROR_EOF);
+  if (audio_q_ != nullptr)
+    av_thread_message_queue_set_err_send(audio_q_, AVERROR_EOF);
+}
+
+void Player::audio_decode_loop() {
+  for (;;) {
+    AVPacket *raw = nullptr;
+    int pr = av_thread_message_queue_recv(audio_q_, &raw, 0);
+    if (pr == 0) {
+      if (avcodec_send_packet(adec_, raw) < 0)
+        std::println(stderr, "audio avcodec_send_packet failed");
+      av_packet_free(&raw);
+      drain_audio();
+    } else if (pr == AVERROR_EOF) {
+      avcodec_send_packet(adec_, nullptr); // flush buffered audio frames
+      drain_audio();
+      av_thread_message_queue_set_err_send(audio_frame_q_, AVERROR_EOF);
+      return;
+    } else {
+      return;
+    }
+  }
 }
 
 AVFrame *Player::next_frame() {
@@ -280,24 +364,17 @@ AVFrame *Player::next_frame() {
     // Pull the next demuxed packet (blocking: the demux thread feeds this).
     if (pending_pkt_->buf == nullptr && !demux_eof_) {
       AVPacket *raw = nullptr;
-      int pr = av_thread_message_queue_recv(packet_q_, &raw, 0);
+      int pr = av_thread_message_queue_recv(video_q_, &raw, 0);
       if (pr == 0) {
-        if (raw->stream_index == stream_) {
-          int sr = avcodec_send_packet(dec_, raw);
-          if (sr == AVERROR(EAGAIN))
-            av_packet_move_ref(pending_pkt_, raw);
-          else if (sr < 0)
-            std::println(stderr, "avcodec_send_packet: {}", av_err_str(sr));
-        } else if (raw->stream_index == audio_stream_) {
-          if (avcodec_send_packet(adec_, raw) >= 0)
-            drain_audio();
-        }
+        int sr = avcodec_send_packet(dec_, raw);
+        if (sr == AVERROR(EAGAIN))
+          av_packet_move_ref(pending_pkt_, raw);
+        else if (sr < 0)
+          std::println(stderr, "avcodec_send_packet: {}", av_err_str(sr));
         av_packet_free(&raw);
       } else if (pr == AVERROR_EOF) {
         demux_eof_ = true;
         avcodec_send_packet(dec_, nullptr); // flush buffered video frames
-        if (adec_ != nullptr)
-          avcodec_send_packet(adec_, nullptr);
       } else {
         std::println(stderr, "demux queue: {}", av_err_str(pr));
         demux_eof_ = true;
@@ -306,10 +383,8 @@ AVFrame *Player::next_frame() {
 
     // Return a decoded video frame whenever one is ready.
     int ret = avcodec_receive_frame(dec_, frame);
-    if (ret == 0) {
-      drain_audio();
+    if (ret == 0)
       return frame;
-    }
     if (ret == AVERROR_EOF)
       break;
     if (ret != AVERROR(EAGAIN))
@@ -319,7 +394,6 @@ AVFrame *Player::next_frame() {
     // EAGAIN: keep pulling packets until a frame materializes.
   }
 
-  drain_audio();
   eof_ = true;
   av_frame_free(&frame);
   return nullptr;
@@ -331,10 +405,14 @@ void Player::drain_audio() {
   for (;;) {
     AVFrame *af = av_frame_alloc();
     if (af == nullptr)
-      throw std::bad_alloc();
+      break;
     int ret = avcodec_receive_frame(adec_, af);
     if (ret == 0) {
-      audio_queue_.push_back(af);
+      // Blocking send applies backpressure: the audio thread pauses when the
+      // main thread stops draining (e.g. during video pacing).
+      int sr = av_thread_message_queue_send(audio_frame_q_, &af, 0);
+      if (sr < 0)
+        av_frame_free(&af);
       continue;
     }
     av_frame_free(&af);
@@ -343,10 +421,13 @@ void Player::drain_audio() {
 }
 
 AVFrame *Player::take_audio_frame() {
-  if (audio_queue_.empty())
+  if (audio_frame_q_ == nullptr)
     return nullptr;
-  AVFrame *af = audio_queue_.front();
-  audio_queue_.pop_front();
+  AVFrame *af = nullptr;
+  int ret = av_thread_message_queue_recv(audio_frame_q_, &af,
+                                         AV_THREAD_MESSAGE_NONBLOCK);
+  if (ret < 0)
+    return nullptr;
   return af;
 }
 
@@ -354,14 +435,20 @@ void Player::rewind() {
   if (fmt_ == nullptr)
     return;
 
-  // The demux thread has already exited at EOF, but join defensively before
-  // touching fmt_.
+  // Both worker threads have normally exited at EOF; stop_demux/stop_adec
+  // are safe no-ops then. If an audio frame send is still blocked on a full
+  // queue, err_send unblocks it so the join can't deadlock.
   stop_demux();
+  if (audio_frame_q_ != nullptr)
+    av_thread_message_queue_set_err_send(audio_frame_q_, AVERROR_EXIT);
+  stop_adec();
 
-  if (packet_q_ != nullptr) {
-    av_thread_message_flush(packet_q_);
-    av_thread_message_queue_set_err_send(packet_q_, 0);
-    av_thread_message_queue_set_err_recv(packet_q_, 0);
+  for (AVThreadMessageQueue **q : {&video_q_, &audio_q_, &audio_frame_q_}) {
+    if (*q == nullptr)
+      continue;
+    av_thread_message_flush(*q);
+    av_thread_message_queue_set_err_send(*q, 0);
+    av_thread_message_queue_set_err_recv(*q, 0);
   }
 
   int ret = av_seek_frame(fmt_, stream_, 0, AVSEEK_FLAG_BACKWARD);
@@ -371,11 +458,10 @@ void Player::rewind() {
   if (adec_ != nullptr)
     avcodec_flush_buffers(adec_);
   av_packet_unref(pending_pkt_);
-  for (AVFrame *af : audio_queue_)
-    av_frame_free(&af);
-  audio_queue_.clear();
   eof_ = false;
   demux_eof_ = false;
 
   start_demux();
+  if (info_.has_audio)
+    start_adec();
 }

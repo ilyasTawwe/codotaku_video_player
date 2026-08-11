@@ -84,6 +84,9 @@ endif()
 target_compile_definitions(codotaku_video_player PRIVATE
     SDL_MAIN_USE_CALLBACKS
     CODOTAKU_DEFAULT_VIDEO_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/bbb_sunflower_1080p_60fps_normal.mp4")
+if(WIN32)
+    target_compile_definitions(codotaku_video_player PRIVATE NOMINMAX)
+endif()
 if(MSVC)
     target_compile_options(codotaku_video_player PRIVATE /EHsc)
 endif()

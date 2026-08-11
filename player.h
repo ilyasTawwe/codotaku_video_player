@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <deque>
 #include <thread>
 
 extern "C" {
@@ -18,17 +17,21 @@ struct PlayerInfo {
   AVRational time_base{};
   const char *codec_name = nullptr;
   bool hwaccel = false;
+  double fps = 0.0;
   bool has_audio = false;
   int audio_sample_rate = 0;
   int audio_channels = 0;
+  AVRational audio_time_base{};
 };
 
 // Demuxes and decodes a single video stream. Frames are returned as new
 // references and may be in a hardware pixel format (AV_PIX_FMT_VULKAN) when
 // hardware decoding is active, or a software format otherwise.
 //
-// Demuxing runs on a dedicated thread that pushes AVPackets through an
-// AVThreadMessageQueue; decoding happens on the caller's thread.
+// Demuxing runs on a dedicated thread that dispatches AVPackets through two
+// AVThreadMessageQueues (video and audio). Video decoding happens on the
+// caller's thread; audio decoding runs on its own thread that pushes decoded
+// AVFrames onto a third queue consumed by the caller.
 class Player {
 public:
   Player() = default;
@@ -48,7 +51,13 @@ public:
   // The caller takes ownership and must av_frame_free() it.
   AVFrame *take_audio_frame();
 
-  bool audio_pending() const { return !audio_queue_.empty(); }
+  bool audio_pending() const { return audio_queue_depth() > 0; }
+
+  int audio_queue_depth() const {
+    return audio_frame_q_ == nullptr
+               ? 0
+               : av_thread_message_queue_nb_elems(audio_frame_q_);
+  }
 
   // Seek back to the start and resume decoding (for looping).
   void rewind();
@@ -68,20 +77,25 @@ private:
   bool vulkan_hw_config(const AVCodec *codec) const;
   void start_demux();
   void stop_demux();
+  void start_adec();
+  void stop_adec();
   void demux_loop();
+  void audio_decode_loop();
   static int demux_interrupt_cb(void *opaque);
 
   AVFormatContext *fmt_ = nullptr;
   AVCodecContext *dec_ = nullptr;
   AVCodecContext *adec_ = nullptr;
   AVPacket *pending_pkt_ = nullptr;
-  AVThreadMessageQueue *packet_q_ = nullptr;
+  AVThreadMessageQueue *video_q_ = nullptr;
+  AVThreadMessageQueue *audio_q_ = nullptr;
+  AVThreadMessageQueue *audio_frame_q_ = nullptr;
   std::thread demux_thread_;
+  std::thread adec_thread_;
   DemuxInterrupt interrupt_;
   bool demux_eof_ = false;
   int stream_ = -1;
   int audio_stream_ = -1;
   bool eof_ = false;
   PlayerInfo info_;
-  std::deque<AVFrame *> audio_queue_;
 };
