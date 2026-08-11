@@ -14,6 +14,8 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
+#include <libavutil/log.h>
+#include <libavutil/samplefmt.h>
 #include <libavutil/time.h>
 }
 
@@ -65,6 +67,7 @@ struct App {
   pl_renderer renderer;
   Player player;
   pl_tex frame_tex[4]{};
+  SDL_AudioStream *audio_stream = nullptr;
 
   // Playback clock. `base_pts_us` is the PTS (us) of the first displayed
   // frame, anchored to `base_clock_ns` in SDL monotonic time.
@@ -131,7 +134,7 @@ auto create_vulkan(App &app) -> void {
   struct pl_log_params log_params = {
       .log_cb = pl_log_simple,
       .log_priv = stderr,
-      .log_level = PL_LOG_DEBUG,
+      .log_level = PL_LOG_WARN,
   };
   app.log = pl_log_create(PL_API_VER, &log_params);
 
@@ -253,9 +256,74 @@ auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
   return SDL_APP_CONTINUE;
 }
 
+// Convert one decoded audio frame to SDL and queue it on the output stream.
+// SDL handles sample-rate, channel, and format conversion internally.
+auto push_audio(App &app, AVFrame *frame) -> void {
+  SDL_AudioFormat fmt = SDL_AUDIO_UNKNOWN;
+  switch (static_cast<AVSampleFormat>(frame->format)) {
+  case AV_SAMPLE_FMT_U8:
+    fmt = SDL_AUDIO_U8;
+    break;
+  case AV_SAMPLE_FMT_S16:
+  case AV_SAMPLE_FMT_S16P:
+    fmt = SDL_AUDIO_S16;
+    break;
+  case AV_SAMPLE_FMT_S32:
+  case AV_SAMPLE_FMT_S32P:
+    fmt = SDL_AUDIO_S32;
+    break;
+  case AV_SAMPLE_FMT_FLT:
+  case AV_SAMPLE_FMT_FLTP:
+    fmt = SDL_AUDIO_F32;
+    break;
+  default:
+    std::println(stderr, "unsupported audio sample format: {}",
+                 av_get_sample_fmt_name(
+                     static_cast<AVSampleFormat>(frame->format)));
+    av_frame_free(&frame);
+    return;
+  }
+
+  SDL_AudioSpec spec = {.format = fmt,
+                        .channels = frame->ch_layout.nb_channels,
+                        .freq = frame->sample_rate};
+  if (!SDL_SetAudioStreamFormat(app.audio_stream, &spec, nullptr)) {
+    std::println(stderr, "SDL_SetAudioStreamFormat: {}", SDL_GetError());
+    av_frame_free(&frame);
+    return;
+  }
+
+  bool ok = false;
+  if (av_sample_fmt_is_planar(static_cast<AVSampleFormat>(frame->format))) {
+    ok = SDL_PutAudioStreamPlanarData(
+        app.audio_stream,
+        reinterpret_cast<const void *const *>(frame->extended_data),
+        frame->ch_layout.nb_channels, frame->nb_samples);
+  } else {
+    int bytes =
+        frame->nb_samples *
+        av_get_bytes_per_sample(static_cast<AVSampleFormat>(frame->format)) *
+        frame->ch_layout.nb_channels;
+    ok = SDL_PutAudioStreamData(app.audio_stream, frame->data[0], bytes);
+  }
+  if (!ok)
+    std::println(stderr, "SDL_PutAudioStreamData: {}", SDL_GetError());
+  av_frame_free(&frame);
+}
+
+auto drain_audio(App &app) -> void {
+  if (app.audio_stream == nullptr)
+    return;
+  while (AVFrame *frame = app.player.take_audio_frame())
+    push_audio(app, frame);
+}
+
 auto SDL_AppInit(void **appstate, int argc, char **argv) -> SDL_AppResult try {
   auto app = new App{};
   *appstate = app;
+
+  // Only surface actual problems from FFmpeg and libplacebo.
+  av_log_set_level(AV_LOG_WARNING);
 
   chk(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO));
 
@@ -277,6 +345,15 @@ auto SDL_AppInit(void **appstate, int argc, char **argv) -> SDL_AppResult try {
   if (info.duration_us > 0)
     std::println("duration: {:.1f}s", info.duration_us / 1e6);
 
+  if (info.has_audio) {
+    app->audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                                                  nullptr, nullptr, nullptr);
+    chk(app->audio_stream);
+    chk(SDL_ResumeAudioStreamDevice(app->audio_stream));
+    std::println("audio: {} channel(s) @ {} Hz", info.audio_channels,
+                 info.audio_sample_rate);
+  }
+
   chk(SDL_ShowWindow(app->window));
   return SDL_APP_CONTINUE;
 } catch (const std::exception &e) {
@@ -292,10 +369,14 @@ auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
     return SDL_APP_CONTINUE;
   }
 
+  drain_audio(*app);
+
   AVFrame *frame = app->player.next_frame();
   if (frame == nullptr) {
     if (app->player.eof()) {
       app->player.rewind();
+      if (app->audio_stream != nullptr)
+        SDL_ClearAudioStream(app->audio_stream);
       app->base_pts_us = AV_NOPTS_VALUE;
       frame = app->player.next_frame();
     }
@@ -342,6 +423,12 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
     if (event->key.key == SDLK_SPACE) {
       auto *app = static_cast<App *>(appstate);
       app->paused = !app->paused;
+      if (app->audio_stream != nullptr) {
+        if (app->paused)
+          SDL_PauseAudioStreamDevice(app->audio_stream);
+        else
+          SDL_ResumeAudioStreamDevice(app->audio_stream);
+      }
       std::println("{}", app->paused ? "paused" : "playing");
     }
     break;
@@ -356,6 +443,8 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
 
 void SDL_AppQuit(void *appstate, SDL_AppResult result) try {
   auto *app = static_cast<App *>(appstate);
+  if (app->audio_stream != nullptr)
+    SDL_DestroyAudioStream(app->audio_stream);
   if (app->renderer != nullptr)
     pl_renderer_destroy(&app->renderer);
   if (app->gpu != nullptr)
