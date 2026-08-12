@@ -12,11 +12,11 @@ if(UNIX AND NOT APPLE)
     # libraries under external/ (those are Windows-only).
     find_package(PkgConfig REQUIRED)
     find_package(Vulkan REQUIRED) # for <vulkan/vulkan.h>
-    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale libswresample)
     pkg_check_modules(PLACEBO REQUIRED IMPORTED_TARGET libplacebo)
     pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 
-    add_executable(codotaku_video_player main.cpp player.cpp libav_impl.c stb_truetype.cpp)
+    add_executable(codotaku_video_player main.cpp player.cpp exporter.cpp libav_impl.c stb_truetype.cpp)
     target_link_libraries(codotaku_video_player PRIVATE
         PkgConfig::FFMPEG
         PkgConfig::PLACEBO
@@ -71,11 +71,13 @@ else()
         target_link_libraries(Placebo::placebo INTERFACE Vulkan::Headers)
     endif()
 
-    add_executable(codotaku_video_player main.cpp player.cpp libav_impl.c stb_truetype.cpp)
+    add_executable(codotaku_video_player main.cpp player.cpp exporter.cpp libav_impl.c stb_truetype.cpp)
     target_link_libraries(codotaku_video_player PRIVATE
         FFmpeg::avformat
         FFmpeg::avcodec
         FFmpeg::avutil
+        FFmpeg::swscale
+        FFmpeg::swresample
         Placebo::placebo
         SDL3::SDL3
     )

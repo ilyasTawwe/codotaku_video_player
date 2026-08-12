@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <exception>
 #include <format>
+#include <memory>
 #include <optional>
 #include <print>
 #include <source_location>
@@ -36,6 +37,7 @@ extern "C" {
 #include <libplacebo/vulkan.h>
 
 #include "annotations.h"
+#include "exporter.h"
 #include "player.h"
 #include "sync.h"
 
@@ -90,8 +92,7 @@ struct App {
   Uint64 fps_log_ns = 0;
   Uint64 fps_frames = 0;
 
-  // Per-second A/V sync log. Values are NAN until the corresponding clock is
-  // wired up in later milestones.
+  // Per-second A/V sync log (audio master when present, wall clock otherwise).
   Uint64 sync_log_ns = 0;
   MediaClock vidclk;
   MediaClock wall;   // external/wall clock: master for files without audio
@@ -139,6 +140,25 @@ struct App {
   // Last aspect-corrected video display rectangle, in window pixels (y-down).
   // Used to map mouse input to normalized video coordinates.
   pl_rect2df video_rect{};
+
+  // --- Export -------------------------------------------------------------
+  // The exporter is non-null while an export is running; SDL_AppIterate then
+  // drives decode/encode exclusively (no playback pacing or audio output).
+  // The pipeline mirrors the overlay path: video is composited into
+  // `export_tex`, the CPU raster is uploaded to `export_overlay_tex`, a blend
+  // pass merges them into `export_out_tex`, which is read back and encoded.
+  std::unique_ptr<Exporter> exporter;
+  pl_tex export_tex = nullptr;
+  pl_tex export_overlay_tex = nullptr;
+  pl_tex export_out_tex = nullptr;
+  pl_pass export_blend_pass = nullptr;
+  int export_w = 0;
+  int export_h = 0;
+  AnnoRaster export_raster;  // annotation raster at video resolution
+  std::vector<uint8_t> export_rgba;  // readback buffer (w*h*4)
+  double export_start_wall = 0.0;    // wall time when export started
+  Uint64 export_log_ns = 0;
+  int64_t export_frames = 0;
 };
 
 auto append_ext(std::string &buf, const char *ext) -> void {
@@ -429,6 +449,97 @@ struct OverlayVtx {
   float _pad[2];  // keep the vertex stride a multiple of any GPU alignment
 };
 
+// Create the annotation blend pass: samples the composited video texture and
+// the CPU-rasterized overlay texture and merges them into a `target_format`
+// render target. Shared by the on-screen and export pipelines so both produce
+// byte-identical blending.
+auto create_blend_pass(pl_gpu gpu, pl_fmt target_format) -> pl_pass {
+  static const char *kVertexShader = R"glsl(
+#version 450
+layout(location = 0) in vec2 pos;
+void main() {
+  gl_Position = vec4(pos, 0.0, 1.0);
+}
+)glsl";
+  static const char *kFragmentShader = R"glsl(
+#version 450
+layout(binding = 0) uniform sampler2D video_tex;
+layout(binding = 1) uniform sampler2D overlay_tex;
+layout(push_constant) uniform Push {
+  vec2 resolution;
+} push;
+layout(location = 0) out vec4 out_color;
+void main() {
+  vec2 uv = gl_FragCoord.xy / push.resolution;
+  vec4 video = texture(video_tex, uv);
+  vec4 ov = texture(overlay_tex, uv);
+  vec3 rgb = video.rgb * (1.0 - ov.a) + ov.rgb * ov.a;
+  out_color = vec4(rgb, video.a);
+}
+)glsl";
+
+  pl_fmt pos_fmt =
+      pl_find_fmt(gpu, PL_FMT_FLOAT, 2, 32, 0, PL_FMT_CAP_VERTEX);
+  if (pos_fmt == nullptr)
+    return nullptr;
+  struct pl_vertex_attrib va = {
+      .name = "pos",
+      .fmt = pos_fmt,
+      .offset = 0,
+      .location = 0,
+  };
+  struct pl_desc descs[2] = {
+      {.name = "video_tex", .type = PL_DESC_SAMPLED_TEX, .binding = 0},
+      {.name = "overlay_tex", .type = PL_DESC_SAMPLED_TEX, .binding = 1},
+  };
+  struct pl_pass_params pp = {};
+  pp.type = PL_PASS_RASTER;
+  pp.descriptors = descs;
+  pp.num_descriptors = 2;
+  pp.push_constants_size = sizeof(float) * 2;
+  pp.glsl_shader = kFragmentShader;
+  pp.vertex_type = PL_PRIM_TRIANGLE_LIST;
+  pp.vertex_attribs = &va;
+  pp.num_vertex_attribs = 1;
+  pp.vertex_stride = sizeof(OverlayVtx);
+  pp.vertex_shader = kVertexShader;
+  pp.target_format = target_format;
+  pp.load_target = false;
+  return pl_pass_create(gpu, &pp);
+}
+
+// Upload `raster` to `overlay_tex` and run the blend pass merging `video_tex`
+// over it into `target`.
+auto run_overlay_blend(App &app, pl_pass pass, pl_tex video_tex,
+                       pl_tex overlay_tex, pl_tex target,
+                       AnnoRaster &raster) -> void {
+  struct pl_tex_transfer_params upload = {};
+  upload.tex = overlay_tex;
+  upload.row_pitch = static_cast<size_t>(raster.w) * 4;
+  upload.ptr = raster.buf.data();
+  pl_tex_upload(app.gpu, &upload);
+
+  static const OverlayVtx kTri[3] = {
+      {-1.0f, -1.0f, {}}, {3.0f, -1.0f, {}}, {-1.0f, 3.0f, {}},
+  };
+  struct pl_desc_binding bindings[2] = {
+      {.object = video_tex, .address_mode = PL_TEX_ADDRESS_CLAMP,
+       .sample_mode = PL_TEX_SAMPLE_NEAREST},
+      {.object = overlay_tex, .address_mode = PL_TEX_ADDRESS_CLAMP,
+       .sample_mode = PL_TEX_SAMPLE_NEAREST},
+  };
+  float resolution[2] = {static_cast<float>(raster.w),
+                         static_cast<float>(raster.h)};
+  struct pl_pass_run_params run = {};
+  run.pass = pass;
+  run.desc_bindings = bindings;
+  run.push_constants = resolution;
+  run.target = target;
+  run.vertex_data = kTri;
+  run.vertex_count = 3;
+  pl_pass_run(app.gpu, &run);
+}
+
 // (Re)create the offscreen video texture, the overlay texture, and the blend
 // pass whenever the swapchain changes size or format.
 auto ensure_overlay_resources(App &app, pl_fmt fbo_fmt, int w, int h) -> void {
@@ -498,64 +609,10 @@ auto ensure_overlay_resources(App &app, pl_fmt fbo_fmt, int w, int h) -> void {
     return;
   }
 
-  static const char *kVertexShader = R"glsl(
-#version 450
-layout(location = 0) in vec2 pos;
-void main() {
-  gl_Position = vec4(pos, 0.0, 1.0);
-}
-)glsl";
-  static const char *kFragmentShader = R"glsl(
-#version 450
-layout(binding = 0) uniform sampler2D video_tex;
-layout(binding = 1) uniform sampler2D overlay_tex;
-layout(push_constant) uniform Push {
-  vec2 resolution;
-} push;
-layout(location = 0) out vec4 out_color;
-void main() {
-  vec2 uv = gl_FragCoord.xy / push.resolution;
-  vec4 video = texture(video_tex, uv);
-  vec4 ov = texture(overlay_tex, uv);
-  vec3 rgb = video.rgb * (1.0 - ov.a) + ov.rgb * ov.a;
-  out_color = vec4(rgb, video.a);
-}
-)glsl";
-
-  pl_fmt pos_fmt = pl_find_fmt(app.gpu, PL_FMT_FLOAT, 2, 32, 0,
-                               PL_FMT_CAP_VERTEX);
-  if (pos_fmt == nullptr) {
-    std::println(stderr, "annotation: no vertex format");
-    return;
-  }
-  struct pl_vertex_attrib va = {
-      .name = "pos",
-      .fmt = pos_fmt,
-      .offset = 0,
-      .location = 0,
-  };
-  struct pl_desc descs[2] = {
-      {.name = "video_tex", .type = PL_DESC_SAMPLED_TEX, .binding = 0},
-      {.name = "overlay_tex", .type = PL_DESC_SAMPLED_TEX, .binding = 1},
-  };
   pl_fmt target_fmt = fbo_fmt;
   if (target_fmt == nullptr || !(target_fmt->caps & PL_FMT_CAP_RENDERABLE))
     target_fmt = video_fmt;
-
-  struct pl_pass_params pp = {};
-  pp.type = PL_PASS_RASTER;
-  pp.descriptors = descs;
-  pp.num_descriptors = 2;
-  pp.push_constants_size = sizeof(float) * 2;
-  pp.glsl_shader = kFragmentShader;
-  pp.vertex_type = PL_PRIM_TRIANGLE_LIST;
-  pp.vertex_attribs = &va;
-  pp.num_vertex_attribs = 1;
-  pp.vertex_stride = sizeof(OverlayVtx);
-  pp.vertex_shader = kVertexShader;
-  pp.target_format = target_fmt;
-  pp.load_target = false;
-  app.blend_pass = pl_pass_create(app.gpu, &pp);
+  app.blend_pass = create_blend_pass(app.gpu, target_fmt);
   if (app.blend_pass == nullptr)
     std::println(stderr, "annotation: failed to create blend pass");
 }
@@ -592,41 +649,20 @@ auto blend_overlay(App &app, pl_tex target) -> void {
     app.raster.draw_annotation(preview);
   }
 
-  struct pl_tex_transfer_params upload = {};
-  upload.tex = app.overlay_tex;
-  upload.row_pitch = static_cast<size_t>(app.overlay_w) * 4;
-  upload.ptr = app.raster.buf.data();
-  pl_tex_upload(app.gpu, &upload);
-
-  static const OverlayVtx kTri[3] = {
-      {-1.0f, -1.0f, {}}, {3.0f, -1.0f, {}}, {-1.0f, 3.0f, {}},
-  };
-  struct pl_desc_binding bindings[2] = {
-      {.object = app.video_tex, .address_mode = PL_TEX_ADDRESS_CLAMP,
-       .sample_mode = PL_TEX_SAMPLE_NEAREST},
-      {.object = app.overlay_tex, .address_mode = PL_TEX_ADDRESS_CLAMP,
-       .sample_mode = PL_TEX_SAMPLE_NEAREST},
-  };
-  float resolution[2] = {static_cast<float>(app.overlay_w),
-                         static_cast<float>(app.overlay_h)};
-  struct pl_pass_run_params run = {};
-  run.pass = app.blend_pass;
-  run.desc_bindings = bindings;
-  run.push_constants = resolution;
-  run.target = target;
-  run.vertex_data = kTri;
-  run.vertex_count = 3;
-  pl_pass_run(app.gpu, &run);
+  run_overlay_blend(app, app.blend_pass, app.video_tex, app.overlay_tex,
+                    target, app.raster);
 }
 
 // Composite a decoded frame into an already-resolved target frame (e.g. the
 // current swapchain FBO). This is the seam between compositing and
 // presentation: everything libplacebo needs is passed as data, so the same
 // call can later drive offscreen targets for export. The target's crop must
-// span the full output area; it is replaced with the aspect-corrected video
-// rect here.
+// span the full output area; unless `aspect_fit` is false, it is replaced
+// with the aspect-corrected video rect here. With aspect_fit=false the full
+// coded frame maps to the whole target (square export at source resolution).
 auto composite_frame(App &app, AVFrame *frame, pl_frame *target,
-                     const struct pl_render_params *params) -> bool {
+                     const struct pl_render_params *params,
+                     bool aspect_fit = true) -> bool {
   struct pl_frame pic {};
   struct pl_avframe_params map_params = {
       .frame = frame,
@@ -638,13 +674,285 @@ auto composite_frame(App &app, AVFrame *frame, pl_frame *target,
     return false;
   }
 
-  pl_rect2df_aspect_copy(&target->crop, &pic.crop, 0.5f);
+  if (aspect_fit)
+    pl_rect2df_aspect_copy(&target->crop, &pic.crop, 0.5f);
 
   bool ok = pl_render_image(app.renderer, &pic, target, params);
   pl_unmap_avframe(app.gpu, &pic);
   if (!ok)
     std::println(stderr, "pl_render_image failed");
   return ok;
+}
+
+// --- Export ---------------------------------------------------------------
+auto destroy_export_resources(App &app) -> void;
+auto seek_app(App &app, double seconds) -> void;
+auto finish_export(App &app) -> void;
+auto cancel_export(App &app) -> void;
+
+// (Re)create the offscreen render target, overlay texture, readback target,
+// and blend pass used to bake annotations into the exported video.
+auto ensure_export_resources(App &app, int w, int h) -> bool {
+  if (app.export_tex != nullptr && app.export_w == w && app.export_h == h)
+    return true;
+
+  destroy_export_resources(app);
+  app.export_w = w;
+  app.export_h = h;
+
+  pl_fmt rgba8 = pl_find_named_fmt(app.gpu, "rgba8");
+  constexpr int kNeed = PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
+                        PL_FMT_CAP_HOST_READABLE;
+  if (rgba8 == nullptr || (rgba8->caps & kNeed) != kNeed) {
+    std::println(stderr, "export: rgba8 lacks render/sample/readback caps");
+    return false;
+  }
+
+  struct pl_tex_params vp = {};
+  vp.w = w;
+  vp.h = h;
+  vp.format = rgba8;
+  vp.sampleable = true;
+  vp.renderable = true;
+  vp.blit_dst = true;  // renderer may clear the target border via a blit
+  app.export_tex = pl_tex_create(app.gpu, &vp);
+
+  struct pl_tex_params op = {};
+  op.w = w;
+  op.h = h;
+  op.format = rgba8;
+  op.sampleable = true;
+  op.host_writable = true;
+  app.export_overlay_tex = pl_tex_create(app.gpu, &op);
+
+  struct pl_tex_params rp = {};
+  rp.w = w;
+  rp.h = h;
+  rp.format = rgba8;
+  rp.renderable = true;
+  rp.sampleable = true;
+  rp.host_readable = true;
+  app.export_out_tex = pl_tex_create(app.gpu, &rp);
+
+  app.export_blend_pass = create_blend_pass(app.gpu, rgba8);
+
+  if (app.export_tex == nullptr || app.export_overlay_tex == nullptr ||
+      app.export_out_tex == nullptr || app.export_blend_pass == nullptr) {
+    std::println(stderr, "export: failed to create offscreen resources");
+    destroy_export_resources(app);
+    return false;
+  }
+  app.export_raster.resize(w, h);
+  app.export_raster.set_display_rect(0, 0, w, h);
+  app.export_rgba.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+  return true;
+}
+
+auto destroy_export_resources(App &app) -> void {
+  if (app.gpu == nullptr)
+    return;
+  if (app.export_tex != nullptr)
+    pl_tex_destroy(app.gpu, &app.export_tex);
+  if (app.export_overlay_tex != nullptr)
+    pl_tex_destroy(app.gpu, &app.export_overlay_tex);
+  if (app.export_out_tex != nullptr)
+    pl_tex_destroy(app.gpu, &app.export_out_tex);
+  if (app.export_blend_pass != nullptr)
+    pl_pass_destroy(app.gpu, &app.export_blend_pass);
+  app.export_tex = nullptr;
+  app.export_overlay_tex = nullptr;
+  app.export_out_tex = nullptr;
+  app.export_blend_pass = nullptr;
+  app.export_w = 0;
+  app.export_h = 0;
+}
+
+auto start_export(App &app) -> void {
+  if (app.exporter != nullptr) {
+    std::println(stderr, "export: already in progress");
+    return;
+  }
+  const PlayerInfo &info = app.player.info();
+  if (info.width <= 0 || info.height <= 0) {
+    std::println(stderr, "export: no video loaded");
+    return;
+  }
+
+  std::string path = std::format("export_{}.mp4",
+                                 static_cast<int64_t>(now_s()));
+  auto exp = std::make_unique<Exporter>();
+  try {
+    exp->open(path.c_str(), info.width, info.height,
+              info.fps > 0.0 ? info.fps : 30.0, info.sar,
+              info.audio_time_base, app.player.audio_codecpar());
+  } catch (const std::exception &e) {
+    std::println(stderr, "export: failed to start: {}", e.what());
+    return;
+  }
+  if (exp->has_audio())
+    app.player.set_audio_capture(true);
+  app.exporter = std::move(exp);
+  app.export_frames = 0;
+  app.export_log_ns = 0;
+  app.export_start_wall = now_s();
+
+  // Freeze playback: pause the audio device and rewind. Audio capture (when the
+  // export has an audio track) is enabled before the seek so the demux thread
+  // routes packets from t=0.
+  if (app.audio_stream != nullptr)
+    SDL_PauseAudioStreamDevice(app.audio_stream);
+  app.paused = true;
+  seek_app(app, 0.0);
+
+  std::println("export: {}x{} @ {:.2f} fps -> {} (audio: {})", info.width,
+               info.height, info.fps, path,
+               app.exporter->has_audio() ? "AAC re-encode" : "video-only");
+}
+
+// Composite one decoded frame into the export target, read it back, and hand
+// it to the encoder. Runs once per SDL_AppIterate while exporting.
+auto pump_export(App &app) -> SDL_AppResult {
+  AVFrame *frame = app.player.next_frame();
+  if (frame == nullptr) {
+    if (app.player.eof()) {
+      app.exporter->finish();
+      finish_export(app);
+    }
+    return SDL_APP_CONTINUE;
+  }
+
+  const PlayerInfo &info = app.player.info();
+  if (!ensure_export_resources(app, info.width, info.height)) {
+    av_frame_free(&frame);
+    cancel_export(app);
+    return SDL_APP_CONTINUE;
+  }
+
+  // Pass 1: video (+ shaders) -> export_tex, matching the display path but
+  // targeting BT.709/BT.1886 8-bit SDR so the baked colors are correct.
+  struct pl_frame target = {};
+  target.planes[0].texture = app.export_tex;
+  target.planes[0].flipped = false;
+  target.planes[0].components = 4;
+  target.planes[0].component_mapping[0] = 0;
+  target.planes[0].component_mapping[1] = 1;
+  target.planes[0].component_mapping[2] = 2;
+  target.planes[0].component_mapping[3] = 3;
+  target.num_planes = 1;
+  target.crop = {0.0f, 0.0f, static_cast<float>(info.width),
+                 static_cast<float>(info.height)};
+  target.repr.sys = PL_COLOR_SYSTEM_RGB;
+  target.repr.levels = PL_COLOR_LEVELS_PC;
+  target.repr.alpha = PL_ALPHA_NONE;
+  target.repr.bits = {8, 8, 0};
+  target.color.primaries = PL_COLOR_PRIM_BT_709;
+  target.color.transfer = PL_COLOR_TRC_BT_1886;
+
+  struct pl_render_params params = pl_render_default_params;
+  params.upscaler = &pl_filter_spline36;
+  params.downscaler = &pl_filter_spline36;
+  if (app.shaders_enabled) {
+    params.hooks = app.hooks.empty() ? nullptr : app.hooks.data();
+    params.num_hooks = static_cast<int>(app.hooks.size());
+  }
+
+  if (!composite_frame(app, frame, &target, &params, false)) {
+    std::println(stderr, "export: composite failed");
+    av_frame_free(&frame);
+    cancel_export(app);
+    return SDL_APP_CONTINUE;
+  }
+
+  // Annotations anchored to this frame's media time (the playback clocks are
+  // frozen during export, so use the decoded frame's own timestamp).
+  double t = frame_pts_s(app.player, frame);
+  if (std::isnan(t))
+    t = info.fps > 0.0 ? app.export_frames / info.fps : 0.0;
+  app.export_raster.clear();
+  for (const Annotation &a : app.annotations.items)
+    if (a.visible_at(t))
+      app.export_raster.draw_annotation(a);
+
+  // Pass 2: blend overlay over video into export_out_tex.
+  run_overlay_blend(app, app.export_blend_pass, app.export_tex,
+                    app.export_overlay_tex, app.export_out_tex,
+                    app.export_raster);
+
+  struct pl_tex_transfer_params dl = {};
+  dl.tex = app.export_out_tex;
+  dl.row_pitch = static_cast<size_t>(app.export_w) * 4;
+  dl.ptr = app.export_rgba.data();
+  if (!pl_tex_download(app.gpu, &dl)) {
+    std::println(stderr, "export: pl_tex_download failed");
+    av_frame_free(&frame);
+    cancel_export(app);
+    return SDL_APP_CONTINUE;
+  }
+
+  int64_t pts = frame->pts;
+  if (pts == AV_NOPTS_VALUE)
+    pts = frame->best_effort_timestamp;
+  app.exporter->push_video(app.export_rgba.data(),
+                           static_cast<size_t>(app.export_w) * 4, pts,
+                           app.player.time_base());
+
+  // Mux captured audio packets through; dispose of any decoded audio frames
+  // still in flight so the audio path can't backpressure the demux thread.
+  while (AVPacket *pkt = app.player.take_audio_packet())
+    app.exporter->push_audio(pkt);
+  while (AVFrame *af = app.player.take_audio_frame())
+    av_frame_free(&af);
+
+  app.export_frames++;
+  av_frame_free(&frame);
+
+  Uint64 now_ns = SDL_GetTicksNS();
+  if (app.export_log_ns == 0)
+    app.export_log_ns = now_ns;
+  double elapsed_s =
+      static_cast<double>(now_ns - app.export_log_ns) / SDL_NS_PER_SECOND;
+  if (elapsed_s >= 2.0) {
+    double media = info.fps > 0.0 ? app.export_frames / info.fps : 0.0;
+    double wall = now_s() - app.export_start_wall;
+    std::println(stderr, "export: {} frames, {:.1f}s media in {:.1f}s wall "
+                         "({:.2f}x)",
+                 app.export_frames, media, wall, wall > 0.0 ? wall / media : 0.0);
+    app.export_log_ns = now_ns;
+  }
+  return SDL_APP_CONTINUE;
+}
+
+// End an export: write the trailer, tear down the exporter/resources, rewind
+// to the start, and resume normal playback.
+auto finish_export(App &app) -> void {
+  if (app.exporter == nullptr)
+    return;
+  std::string path = app.exporter->path();
+  app.exporter->finish();
+  app.exporter.reset();
+  app.player.set_audio_capture(false);
+  if (app.audio_stream != nullptr)
+    SDL_ResumeAudioStreamDevice(app.audio_stream);
+  app.paused = false;
+  destroy_export_resources(app);
+  seek_app(app, 0.0);
+  std::println("export: finished -> {} ({} frames)", path, app.export_frames);
+}
+
+// Abort an export: delete the partial file and resume playback.
+auto cancel_export(App &app) -> void {
+  if (app.exporter == nullptr)
+    return;
+  std::string path = app.exporter->path();
+  app.exporter->cancel();
+  app.exporter.reset();
+  app.player.set_audio_capture(false);
+  if (app.audio_stream != nullptr)
+    SDL_ResumeAudioStreamDevice(app.audio_stream);
+  app.paused = false;
+  destroy_export_resources(app);
+  seek_app(app, 0.0);
+  std::println("export: cancelled -> {}", path);
 }
 
 auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
@@ -867,6 +1175,10 @@ auto SDL_AppInit(void **appstate, int argc, char **argv) -> SDL_AppResult try {
 
 auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
   auto *app = static_cast<App *>(appstate);
+
+  // While exporting, drive decode/encode directly (no playback pacing).
+  if (app->exporter != nullptr)
+    return pump_export(*app);
 
   if (app->paused) {
     if (app->pending_seek_redraw) {
@@ -1107,6 +1419,12 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
   }
   case SDL_EVENT_KEY_DOWN: {
     auto *app = static_cast<App *>(appstate);
+    if (app->exporter != nullptr) {
+      // While exporting, swallow all input except Esc (cancel).
+      if (event->key.key == SDLK_ESCAPE)
+        cancel_export(*app);
+      break;
+    }
     const bool in_text =
         app->tool.has_value() && *app->tool == AnnoShape::Text;
     if (in_text && event->key.key == SDLK_ESCAPE) {
@@ -1153,6 +1471,8 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         std::println(stderr, "shaders: {} ({} loaded)",
                      app->shaders_enabled ? "on" : "off", app->hooks.size());
       }
+    } else if (event->key.key == SDLK_X) {
+      start_export(*app);
     } else if (event->key.key == SDLK_LEFT || event->key.key == SDLK_RIGHT) {
       double t = clock_get(app->vidclk);
       if (std::isnan(t))
@@ -1227,6 +1547,11 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
 
 void SDL_AppQuit(void *appstate, SDL_AppResult result) try {
   auto *app = static_cast<App *>(appstate);
+  if (app->exporter != nullptr) {
+    app->exporter->cancel();
+    app->exporter.reset();
+  }
+  destroy_export_resources(*app);
   if (app->audio_stream != nullptr)
     SDL_DestroyAudioStream(app->audio_stream);
   if (app->renderer != nullptr)

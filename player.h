@@ -15,6 +15,7 @@ struct PlayerInfo {
   int height = 0;
   int64_t duration_us = 0;
   AVRational time_base{};
+  AVRational sar{};  // pixel aspect ratio of the source video
   const char *codec_name = nullptr;
   bool hwaccel = false;
   double fps = 0.0;
@@ -74,6 +75,20 @@ public:
   const PlayerInfo &info() const { return info_; }
   AVRational time_base() const { return info_.time_base; }
 
+  // --- Export audio passthrough ------------------------------------------
+  // When enabled, demuxed audio packets are routed to a dedicated capture
+  // queue (instead of the decoder) so the exporter can mux them unchanged.
+  // The toggle only takes effect for packets demuxed after the next seek.
+  void set_audio_capture(bool on);
+
+  // Returns the next captured audio packet (caller frees), or nullptr when
+  // none is queued.
+  AVPacket *take_audio_packet();
+
+  // Encoded parameters of the source audio stream, or nullptr when the file
+  // has no audio. Used to set up the exporter's audio stream.
+  const AVCodecParameters *audio_codecpar() const;
+
 private:
   struct DemuxInterrupt {
     std::atomic<int> abort{0};
@@ -98,6 +113,10 @@ private:
   AVThreadMessageQueue *video_q_ = nullptr;
   AVThreadMessageQueue *audio_q_ = nullptr;
   AVThreadMessageQueue *audio_frame_q_ = nullptr;
+  // Raw encoded audio packets for export, fed by the demux thread when
+  // capture_audio_ is set.
+  AVThreadMessageQueue *audio_pkt_q_ = nullptr;
+  std::atomic<bool> capture_audio_{false};
   std::thread demux_thread_;
   std::thread adec_thread_;
   DemuxInterrupt interrupt_;
