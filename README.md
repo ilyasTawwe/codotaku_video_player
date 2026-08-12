@@ -12,9 +12,17 @@ giving you high-quality scaling and correct HDR color handling.
 - Zero-copy GPU rendering via libplacebo (`pl_map_avframe_ex`)
 - HDR-aware rendering: frames are tone-mapped to the swapchain's color space
 - High-quality scaling (spline36)
-- Real-time playback pacing against the wall clock
-- Loops the video at EOF
-- Space toggles pause
+- Real-time playback pacing against the wall clock, loops at EOF
+- Multi-threaded decode: dedicated demux + audio-decode threads
+- Audio-master A/V sync (ffplay frame_timer model) with frame-drop resync
+- Seeking: click on the video to seek, Left/Right jumps ±10s (works while paused)
+- Annotations: draw rectangles, ellipses, arrows, freehand lines, and text over
+  the video; committed annotations are baked into exports
+- User shaders: load mpv-style `.glsl`/`.hook` packs at startup and toggle them
+  at runtime; the Anime4K pack is bundled
+- Export to MP4 (press `X`): H.264 (libx264) + AAC re-encode with the source
+  channel layout/sample rate preserved; falls back to video-only if audio
+  cannot be re-encoded
 
 ## Requirements
 
@@ -72,21 +80,33 @@ If no file is given, the player falls back to the bundled test clip
 
 ### Controls
 
-| Key       | Action        |
-| --------- | ------------- |
-| `Space`   | Pause/resume  |
-| Close btn | Quit          |
+| Key       | Action                                            |
+| --------- | ------------------------------------------------- |
+| `Space`   | Pause/resume                                      |
+| `X`       | Start export to `export_<timestamp>.mp4` (runs to end of video; `Esc` cancels) |
+| `S`       | Toggle user shaders on/off                        |
+| `←`/`→`   | Seek backward/forward 10 seconds                  |
+| Click     | Seek to that position on the progress bar         |
+| `R`/`E`/`A`/`F`/`T` | Annotation tool: rect / ellipse / arrow / freehand / text |
+| `C`       | Cycle annotation color                            |
+| `Esc`     | Cancel current annotation tool                    |
+| `Backspace` | Remove the most recent annotation                 |
+| Close btn | Quit                                              |
 
 ## Project structure
 
 ```
 main.cpp        SDL3 app: Vulkan device, libplacebo swapchain/renderer, event loop
 player.cpp/h    FFmpeg demux + decode (Vulkan hwaccel with software fallback)
+exporter.cpp/h  MP4 export: H.264 encode + AC3->AAC re-encode, annotation bake
 libav_impl.c    libplacebo <-> libav helpers (PL_LIBAV_IMPLEMENTATION)
 annotations.h   CPU rasterizer for drawing annotations over the video (text via
                 stb_truetype, system TTF font loaded at runtime)
 stb_truetype.cpp TU instantiating the vendored stb_truetype implementation
+sync.h          MediaClock + A/V sync helpers
 CMakeLists.txt  Build: vendored deps on Windows, pkg-config on Linux
+packs/          Bundled user-shader packs (Anime4K) copied next to the exe
+shaders/        First-party shaders (e.g. greyscale test)
 tests/          Sample video (git-lfs)
 ```
 
