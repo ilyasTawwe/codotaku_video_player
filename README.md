@@ -34,6 +34,109 @@ including H.264/HEVC/AV1 and AC3/EAC3/AAC/FLAC/Opus audio.
 - Press `X` to export the current video to MP4 (your drawings included)
 - Press `S` to toggle Anime4K upscaling shaders on/off
 
+## Why is the download so big?
+
+The `*-win64.zip` is around **90–100 MB** for two reasons:
+
+1. **The entire FFmpeg library set ships with the app** — FFmpeg is a *single
+   shared build* that contains every codec, demuxer, and filter, which is what
+   lets one small player exe play H.264, HEVC, AV1, MP3, FLAC, Opus, and everything
+   else out of the box. The three big DLLs are roughly 98 MB (`avfilter`),
+   93 MB (`avcodec`), and 19 MB (`avformat`) uncompressed.
+2. **The Anime4K shader pack is bundled** — 49 ready-to-use shaders under
+   `packs/Anime4K/glsl/` (~5 MB), so upscaling works without downloading
+   anything else.
+
+The zip compresses those down to ~90 MB; there is no installer or extra
+download needed — unzip and it runs.
+
+## Custom shaders
+
+Shaders are plain mpv-style `.glsl` files. Pass any number of them at startup;
+each one is applied in order, and `S` toggles the whole chain on/off. When a
+shader loads, its tunable parameters are printed to the console.
+
+**Bundled — Anime4K** (upscale + sharpen, great for anime and 2D art):
+
+```sh
+codotaku_video_player.exe my-video.mkv --shader packs/Anime4K/glsl/Upscale/Anime4K_Upscale_CNN_x2_M.glsl
+```
+
+Other categories live in `packs/Anime4K/glsl/`: `Deblur`, `Denoise`, `Restore`,
+`Experimental-Effects`, and `Upscale+Denoise`.
+
+**Bundled — greyscale test:**
+
+```sh
+codotaku_video_player.exe my-video.mp4 --shader shaders/greyscale.glsl
+```
+
+You can chain several for a combined effect:
+
+```sh
+codotaku_video_player.exe my-video.mp4 \
+  --shader packs/Anime4K/glsl/Restore/Anime4K_Restore_CNN_S.glsl \
+  --shader packs/Anime4K/glsl/Upscale/Anime4K_Upscale_CNN_x2_M.glsl
+```
+
+### Writing your own
+
+A shader is a GLSL snippet annotated with `//!` directives that tell the
+renderer *where* in the pipeline it runs and *which textures* it sees. The
+simplest one, `shaders/greyscale.glsl`, is the best starting point:
+
+```glsl
+//!DESC Greyscale test
+//!HOOK NATIVE
+//!BIND NATIVE
+//!SAVE NATIVE
+//!WIDTH NATIVE.w
+//!HEIGHT NATIVE.h
+vec4 hook() {
+    vec4 c = NATIVE_tex(NATIVE_pos);
+    return vec4(c.r, 0.5, 0.5, c.a);
+}
+```
+
+The pieces:
+
+| Directive    | Meaning |
+| ------------ | ------- |
+| `//!DESC ...` | One-line description shown in the console |
+| `//!HOOK ...` | Where in the pipeline the shader runs (see hook points below) |
+| `//!BIND <T>` | Input texture, exposed to GLSL as `T_tex`, `T_pos`, `T_size`, `T_pt` |
+| `//!SAVE <T>` | Output texture; the shader result replaces `<T>` |
+| `//!WIDTH`/`//!HEIGHT` | Output size, usually expressed in terms of a bound texture |
+| `vec4 hook()` | Entry point; returns the output pixel |
+
+**Hook points** (where your shader runs):
+
+- `NATIVE` — the decoded frame in its original color space, before scaling
+- `LINEAR` — after conversion to linear light, before scaling
+- `SCALED` — after scaling to the target resolution, before color management
+- `OUTPUT` — the last stage, right before the frame is presented
+
+`NATIVE` and `LINEAR` are *resizable* (you pick `WIDTH`/`HEIGHT`, which is how
+upscalers work); the later stages are fixed-size.
+
+**Tunable parameters** — add a slider the player exposes at load time (it
+prints every parameter and its description when the shader loads):
+
+```glsl
+//!PARAM strength
+//!DESC Blend between original and processed
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.8
+```
+
+The default value is the last line; then just use `strength` as a variable in
+`hook()`.
+
+For the full format, see the [libplacebo user-shader
+documentation](https://libplacebo.org/custom-shaders/) (mpv-compatible).
+
 ## Features
 
 - **GPU-accelerated everywhere** — Vulkan hardware decoding (with automatic
