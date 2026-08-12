@@ -23,6 +23,31 @@ struct AnnoPoint {
   float y = 0.0f;  // normalized 0..1, relative to the video frame height
 };
 
+// h/s/v in [0,1]; r/g/b out in [0,1].
+inline void hsv_to_rgb(float h, float s, float v, float &r, float &g,
+                       float &b) {
+  float c = v * s;
+  float hp = h * 6.0f;
+  float x = c * (1.0f - std::fabs(std::fmod(hp, 2.0f) - 1.0f));
+  float m = v - c;
+  if (hp < 1.0f) {
+    r = c; g = x; b = 0.0f;
+  } else if (hp < 2.0f) {
+    r = x; g = c; b = 0.0f;
+  } else if (hp < 3.0f) {
+    r = 0.0f; g = c; b = x;
+  } else if (hp < 4.0f) {
+    r = 0.0f; g = x; b = c;
+  } else if (hp < 5.0f) {
+    r = x; g = 0.0f; b = c;
+  } else {
+    r = c; g = 0.0f; b = x;
+  }
+  r += m;
+  g += m;
+  b += m;
+}
+
 enum class AnnoShape : int { Rect = 0, Ellipse, Arrow, Freehand, Text };
 
 struct Annotation {

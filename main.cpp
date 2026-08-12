@@ -2,6 +2,7 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -121,7 +122,9 @@ struct App {
   AnnoRaster raster;
   // Active editing tool; nullopt == cursor mode (left-click seeks).
   std::optional<AnnoShape> tool;
-  int color_idx = 0;
+  float cur_color[3] = {1.00f, 0.30f, 0.30f};  // current annotation color
+  bool color_picker = false;    // fullscreen gradient picker open
+  AnnoPoint picker_pos{0.5f, 0.5f};  // picker cursor, normalized window coords
   bool drawing = false;             // left-drag in progress
   AnnoPoint draw_anchor{};          // drag start (normalized video coords)
   AnnoPoint draw_cur{};             // current mouse pos (normalized video coords)
@@ -134,6 +137,9 @@ struct App {
   pl_tex video_tex = nullptr;
   pl_tex overlay_tex = nullptr;
   pl_pass blend_pass = nullptr;
+  // Fullscreen color-picker pass: renders the hue×value gradient quad (plus
+  // the cursor marker) directly into the target, no CPU raster involved.
+  pl_pass picker_pass = nullptr;
   int overlay_w = 0;
   int overlay_h = 0;
   pl_fmt overlay_video_fmt = nullptr;
@@ -404,15 +410,39 @@ auto load_shader(App &app, const char *path) -> bool {
 // clean seam for the future export feature, which can run the same two passes
 // into an offscreen texture instead of the swapchain.
 
-constexpr float kAnnoColors[][3] = {
-    {1.00f, 0.30f, 0.30f}, {0.35f, 1.00f, 0.45f}, {0.35f, 0.65f, 1.00f},
-    {1.00f, 0.85f, 0.25f}, {1.00f, 0.55f, 0.95f}, {0.35f, 1.00f, 1.00f},
-    {1.00f, 1.00f, 1.00f}, {0.90f, 0.45f, 0.20f},
-};
-
 auto anno_color(const App &app) -> const float * {
-  return kAnnoColors[app.color_idx %
-                     (sizeof(kAnnoColors) / sizeof(kAnnoColors[0]))];
+  return app.cur_color;
+}
+
+// r/g/b in [0,1]; h/s/v out in [0,1].
+auto rgb_to_hsv(float r, float g, float b, float &h, float &s, float &v)
+    -> void {
+  float mx = std::max(r, std::max(g, b));
+  float mn = std::min(r, std::min(g, b));
+  float d = mx - mn;
+  v = mx;
+  s = mx > 0.0f ? d / mx : 0.0f;
+  if (d == 0.0f) {
+    h = 0.0f;
+  } else if (mx == r) {
+    h = std::fmod((g - b) / d, 6.0f);
+  } else if (mx == g) {
+    h = (b - r) / d + 2.0f;
+  } else {
+    h = (r - g) / d + 4.0f;
+  }
+  h /= 6.0f;
+  if (h < 0.0f)
+    h += 1.0f;
+}
+
+// Map a normalized picker coordinate to an RGB color (hue along x, value
+// along y, full saturation; y-down so value=1 at the top).
+auto picker_color(AnnoPoint p) -> std::array<float, 3> {
+  std::array<float, 3> rgb{};
+  hsv_to_rgb(std::clamp(p.x, 0.0f, 1.0f), 1.0f,
+             std::clamp(1.0f - p.y, 0.0f, 1.0f), rgb[0], rgb[1], rgb[2]);
+  return rgb;
 }
 
 // Media time used to anchor annotations (appear time / removal time).
@@ -511,6 +541,92 @@ void main() {
   return pl_pass_create(gpu, &pp);
 }
 
+// Fullscreen color-picker pass: fills the target with a hue(x) × value(y)
+// gradient at full saturation and draws a marker ring at the picker position.
+// Push constants: vec2 resolution, vec2 picker_px (window pixels).
+auto create_picker_pass(pl_gpu gpu, pl_fmt target_format) -> pl_pass {
+  static const char *kVertexShader = R"glsl(
+#version 450
+layout(location = 0) in vec2 pos;
+void main() {
+  gl_Position = vec4(pos, 0.0, 1.0);
+}
+)glsl";
+  static const char *kFragmentShader = R"glsl(
+#version 450
+layout(push_constant) uniform Push {
+  vec2 resolution;
+  vec2 picker_px;
+} push;
+layout(location = 0) out vec4 out_color;
+
+vec3 hsv2rgb(vec3 c) {
+  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / push.resolution;
+  // Hue along x (0 red .. 1 red), value along y (1 at the top).
+  vec3 rgb = hsv2rgb(vec3(uv.x, 1.0, 1.0 - uv.y));
+  float d = distance(gl_FragCoord.xy, push.picker_px);
+  // Black outer ring + white inner ring around the cursor.
+  float outer = 14.0, outer_th = 3.0;
+  float inner = 8.0, inner_th = 2.5;
+  float ring_out = smoothstep(outer - outer_th - 1.0, outer - outer_th + 1.0, d) -
+                   smoothstep(outer - 1.0, outer + 1.0, d);
+  float ring_in = smoothstep(inner - inner_th - 1.0, inner - inner_th + 1.0, d) -
+                  smoothstep(inner - 1.0, inner + 1.0, d);
+  rgb = mix(rgb, vec3(0.0), clamp(ring_out, 0.0, 1.0));
+  rgb = mix(rgb, vec3(1.0), clamp(ring_in, 0.0, 1.0));
+  out_color = vec4(rgb, 1.0);
+}
+)glsl";
+
+  pl_fmt pos_fmt =
+      pl_find_fmt(gpu, PL_FMT_FLOAT, 2, 32, 0, PL_FMT_CAP_VERTEX);
+  if (pos_fmt == nullptr)
+    return nullptr;
+  struct pl_vertex_attrib va = {
+      .name = "pos",
+      .fmt = pos_fmt,
+      .offset = 0,
+      .location = 0,
+  };
+  struct pl_pass_params pp = {};
+  pp.type = PL_PASS_RASTER;
+  pp.push_constants_size = sizeof(float) * 4;
+  pp.glsl_shader = kFragmentShader;
+  pp.vertex_type = PL_PRIM_TRIANGLE_LIST;
+  pp.vertex_attribs = &va;
+  pp.num_vertex_attribs = 1;
+  pp.vertex_stride = sizeof(OverlayVtx);
+  pp.vertex_shader = kVertexShader;
+  pp.target_format = target_format;
+  pp.load_target = false;
+  return pl_pass_create(gpu, &pp);
+}
+
+// Run the fullscreen color-picker pass into `target`.
+auto run_picker_pass(App &app, pl_tex target) -> void {
+  if (app.picker_pass == nullptr)
+    return;
+  static const OverlayVtx kTri[3] = {
+      {-1.0f, -1.0f, {}}, {3.0f, -1.0f, {}}, {-1.0f, 3.0f, {}},
+  };
+  float push[4] = {
+      static_cast<float>(app.overlay_w), static_cast<float>(app.overlay_h),
+      app.picker_pos.x * app.overlay_w, app.picker_pos.y * app.overlay_h};
+  struct pl_pass_run_params run = {};
+  run.pass = app.picker_pass;
+  run.push_constants = push;
+  run.target = target;
+  run.vertex_data = kTri;
+  run.vertex_count = 3;
+  pl_pass_run(app.gpu, &run);
+}
+
 // Upload `raster` to `overlay_tex` and run the blend pass merging `video_tex`
 // over it into `target`.
 auto run_overlay_blend(App &app, pl_pass pass, pl_tex video_tex,
@@ -558,9 +674,12 @@ auto ensure_overlay_resources(App &app, pl_fmt fbo_fmt, int w, int h) -> void {
     pl_tex_destroy(app.gpu, &app.overlay_tex);
   if (app.blend_pass != nullptr)
     pl_pass_destroy(app.gpu, &app.blend_pass);
+  if (app.picker_pass != nullptr)
+    pl_pass_destroy(app.gpu, &app.picker_pass);
   app.video_tex = nullptr;
   app.overlay_tex = nullptr;
   app.blend_pass = nullptr;
+  app.picker_pass = nullptr;
   app.overlay_w = w;
   app.overlay_h = h;
   app.overlay_video_fmt = fbo_fmt;
@@ -618,10 +737,20 @@ auto ensure_overlay_resources(App &app, pl_fmt fbo_fmt, int w, int h) -> void {
   app.blend_pass = create_blend_pass(app.gpu, target_fmt);
   if (app.blend_pass == nullptr)
     std::println(stderr, "annotation: failed to create blend pass");
+  app.picker_pass = create_picker_pass(app.gpu, target_fmt);
+  if (app.picker_pass == nullptr)
+    std::println(stderr, "color picker: failed to create picker pass");
 }
 
 // Upload the rasterized overlay and blend it over the video into `target`.
 auto blend_overlay(App &app, pl_tex target) -> void {
+  if (app.color_picker) {
+    // Fullscreen gradient picker replaces the annotation overlay, drawn
+    // entirely on the GPU (no CPU raster involved).
+    run_picker_pass(app, target);
+    return;
+  }
+
   if (app.blend_pass == nullptr || app.video_tex == nullptr ||
       app.overlay_tex == nullptr)
     return;
@@ -633,6 +762,7 @@ auto blend_overlay(App &app, pl_tex target) -> void {
       static_cast<int>(std::ceil(app.video_rect.x1 - app.video_rect.x0)),
       static_cast<int>(std::ceil(app.video_rect.y1 - app.video_rect.y0)));
   app.raster.clear();
+
   for (const Annotation &a : app.annotations.items)
     if (a.visible_at(t))
       app.raster.draw_annotation(a);
@@ -1369,6 +1499,24 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
     auto *app = static_cast<App *>(appstate);
     if (event->button.button != SDL_BUTTON_LEFT)
       break;
+    if (app->color_picker) {
+      // Pick the color under the cursor and close the picker.
+      float w = static_cast<float>(app->overlay_w);
+      float h = static_cast<float>(app->overlay_h);
+      if (w > 0.0f && h > 0.0f) {
+        app->picker_pos.x = std::clamp(event->button.x / w, 0.0f, 1.0f);
+        app->picker_pos.y = std::clamp(event->button.y / h, 0.0f, 1.0f);
+      }
+      std::array<float, 3> rgb = picker_color(app->picker_pos);
+      app->cur_color[0] = rgb[0];
+      app->cur_color[1] = rgb[1];
+      app->cur_color[2] = rgb[2];
+      app->color_picker = false;
+      app->overlay_dirty = true;
+      std::println(stderr, "annotation color: rgb({:.3f},{:.3f},{:.3f})",
+                   app->cur_color[0], app->cur_color[1], app->cur_color[2]);
+      break;
+    }
     if (app->tool.has_value()) {
       AnnoPoint p = window_to_anno(*app, event->button.x, event->button.y);
       if (*app->tool == AnnoShape::Text) {
@@ -1444,7 +1592,16 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
   }
   case SDL_EVENT_MOUSE_MOTION: {
     auto *app = static_cast<App *>(appstate);
-    if (app->drawing && app->tool.has_value()) {
+    if (app->color_picker) {
+      // Keep the picker marker under the cursor.
+      float w = static_cast<float>(app->overlay_w);
+      float h = static_cast<float>(app->overlay_h);
+      if (w > 0.0f && h > 0.0f) {
+        app->picker_pos.x = std::clamp(event->motion.x / w, 0.0f, 1.0f);
+        app->picker_pos.y = std::clamp(event->motion.y / h, 0.0f, 1.0f);
+      }
+      app->overlay_dirty = true;
+    } else if (app->drawing && app->tool.has_value()) {
       app->draw_cur = window_to_anno(*app, event->motion.x, event->motion.y);
       app->overlay_dirty = true;
       if (*app->tool == AnnoShape::Freehand) {
@@ -1563,12 +1720,24 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       std::println(stderr, "annotation tool: {}",
                    app->tool ? tool_name(*app->tool) : "none");
     } else if (event->key.key == SDLK_C) {
-      app->color_idx = (app->color_idx + 1) %
-                       (sizeof(kAnnoColors) / sizeof(kAnnoColors[0]));
+      app->color_picker = !app->color_picker;
       app->overlay_dirty = true;
-      std::println(stderr, "annotation color: {}", app->color_idx);
+      if (app->color_picker) {
+        // Seed the marker at the current color's position in the gradient.
+        float h = 0.0f, s = 0.0f, v = 0.0f;
+        rgb_to_hsv(app->cur_color[0], app->cur_color[1], app->cur_color[2],
+                   h, s, v);
+        app->picker_pos.x = h;
+        app->picker_pos.y = 1.0f - v;
+      }
+      std::println(stderr, "color picker: {}",
+                   app->color_picker ? "open" : "closed");
     } else if (event->key.key == SDLK_ESCAPE) {
-      if (app->tool.has_value()) {
+      if (app->color_picker) {
+        app->color_picker = false;
+        app->overlay_dirty = true;
+        std::println(stderr, "color picker: closed");
+      } else if (app->tool.has_value()) {
         app->tool.reset();
         app->drawing = false;
         app->text_buffer.clear();
@@ -1630,6 +1799,8 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) try {
       pl_tex_destroy(app->gpu, &app->overlay_tex);
     if (app->blend_pass != nullptr)
       pl_pass_destroy(app->gpu, &app->blend_pass);
+    if (app->picker_pass != nullptr)
+      pl_pass_destroy(app->gpu, &app->picker_pass);
   }
   if (app->swapchain != nullptr)
     pl_swapchain_destroy(&app->swapchain);
