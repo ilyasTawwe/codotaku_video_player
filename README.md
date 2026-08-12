@@ -1,84 +1,60 @@
 # Codotaku Video Player
 
-A minimal video player built with C++23, SDL3, FFmpeg, and libplacebo.
-It demuxes and decodes video with FFmpeg (Vulkan hardware decoding with a
-software fallback) and renders through libplacebo on a Vulkan swapchain,
-giving you high-quality scaling and correct HDR color handling.
+A fast, good-looking video player for Windows that plays your files smoothly
+even on 4K/HDR content — and lets you draw on the video, apply upscaling
+shaders, and export the result to MP4.
+
+Built with C++23, SDL3, FFmpeg, and libplacebo, it uses your GPU for both
+decoding and rendering: high-quality scaling, correct HDR color, and buttery
+playback without taxing your CPU.
+
+## How to use it
+
+1. **Download** the latest Windows release from the
+   [Releases page](https://github.com/ilyasTawwe/codotaku_video_player/releases)
+   (the `*-win64.zip` file).
+2. **Unzip** it anywhere — no installer, no admin rights.
+3. **Run** `codotaku_video_player.exe` and give it a video file:
+
+   ```sh
+   codotaku_video_player.exe my-video.mp4
+   ```
+
+4. **Play, pause, seek, draw, export** — everything is on the keyboard (see
+   [Controls](#controls) below).
+
+It plays MP4, MKV, MOV, WebM, AVI, and most other formats FFmpeg supports,
+including H.264/HEVC/AV1 and AC3/EAC3/AAC/FLAC/Opus audio.
+
+**Quick tour:**
+
+- `Space` pause/resume · `←`/`→` jump 10s · click anywhere to seek
+- Press `R`/`E`/`A`/`F`/`T` to draw rectangles, ellipses, arrows, freehand
+  lines, or text on top of the video
+- Press `X` to export the current video to MP4 (your drawings included)
+- Press `S` to toggle Anime4K upscaling shaders on/off
 
 ## Features
 
-- Vulkan hardware-accelerated decoding (`AV_PIX_FMT_VULKAN`) with automatic
-  software fallback
-- Zero-copy GPU rendering via libplacebo (`pl_map_avframe_ex`)
-- HDR-aware rendering: frames are tone-mapped to the swapchain's color space
-- High-quality scaling (spline36)
-- Real-time playback pacing against the wall clock, loops at EOF
-- Multi-threaded decode: dedicated demux + audio-decode threads
-- Audio-master A/V sync (ffplay frame_timer model) with frame-drop resync
-- Seeking: click on the video to seek, Left/Right jumps ±10s (works while paused)
-- Annotations: draw rectangles, ellipses, arrows, freehand lines, and text over
-  the video; committed annotations are baked into exports
-- User shaders: load mpv-style `.glsl`/`.hook` packs at startup and toggle them
-  at runtime; the Anime4K pack is bundled
-- Export to MP4 (press `X`): H.264 (libx264) + AAC re-encode with the source
-  channel layout/sample rate preserved; falls back to video-only if audio
-  cannot be re-encoded
+- **GPU-accelerated everywhere** — Vulkan hardware decoding (with automatic
+  software fallback) and zero-copy GPU rendering, so 4K/HDR plays smoothly
+- **HDR-aware** — frames are tone-mapped to your display's color space; no
+  washed-out or crushed colors
+- **Crystal-clear scaling** — high-quality spline36 resampling, plus bundled
+  [Anime4K](https://github.com/bloc97/Anime4K) shaders that upscale and
+  sharpen anime (toggle with `S`)
+- **Rock-solid A/V sync** — audio-master clock with frame-drop resync, like
+  ffplay/mpv; audio never drifts from video
+- **Seek like a pro** — click to seek, `←`/`→` for ±10s; works even while paused
+- **Draw on the video** — rectangles, ellipses, arrows, freehand, and text
+  annotations, in multiple colors, baked straight into your exports
+- **One-key export** — press `X` to write an MP4 (H.264 + AAC) of the current
+  video with your shaders and annotations applied; falls back to video-only if
+  the audio can't be re-encoded
+- **Custom shaders** — load any mpv-style `.glsl`/`.hook` shader pack at
+  startup with `--shader <file>`
 
-## Requirements
-
-### Windows
-
-Prebuilt libraries are vendored under `external/`:
-
-- FFmpeg (`external/ffmpeg`)
-- libplacebo (`external/libplacebo`)
-- stb_truetype (`external/stb`, single public-domain header)
-
-System dependencies:
-
-- [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) (found via `find_package(Vulkan)`)
-- SDL3 (`find_package(SDL3)`, searched via `$VULKAN_SDK/cmake`)
-- A C/C++20+ compiler (the repo is developed with `clang-cl` + Ninja)
-
-### Linux
-
-Uses system packages via pkg-config:
-
-```sh
-sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
-                 libplacebo-dev libsdl3-dev libvulkan-dev
-```
-
-## Building
-
-### Windows
-
-```sh
-cmake --preset default
-cmake --build --preset default-release
-```
-
-The build copies the FFmpeg, libplacebo, and SDL3 DLLs next to the executable
-automatically. The output lands in `out/build/default`.
-
-### Linux
-
-```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-## Usage
-
-```sh
-codotaku_video_player [video-file]
-```
-
-If no file is given, the player falls back to the bundled test clip
-(`tests/bbb_sunflower_1080p_60fps_normal.mp4`), which is committed via
-[Git LFS](https://git-lfs.com) — clone with LFS installed to get it.
-
-### Controls
+## Controls
 
 | Key       | Action                                            |
 | --------- | ------------------------------------------------- |
@@ -93,7 +69,44 @@ If no file is given, the player falls back to the bundled test clip
 | `Backspace` | Remove the most recent annotation                 |
 | Close btn | Quit                                              |
 
-## Project structure
+## For developers
+
+### Requirements
+
+**Windows** — prebuilt libraries are vendored under `external/` (FFmpeg,
+libplacebo, stb_truetype). You need:
+
+- [Vulkan SDK](https://vulkan.lunarg.com/sdk/home)
+- SDL3 (`find_package(SDL3)`, searched via `$VULKAN_SDK/cmake`)
+- A C/C++20+ compiler (the repo is developed with `clang-cl` + Ninja)
+
+**Linux** — uses system packages via pkg-config:
+
+```sh
+sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
+                 libplacebo-dev libsdl3-dev libvulkan-dev
+```
+
+### Building
+
+**Windows:**
+
+```sh
+cmake --preset default
+cmake --build --preset default-release
+```
+
+The build copies the FFmpeg, libplacebo, and SDL3 DLLs next to the executable
+automatically. The output lands in `out/build/default`.
+
+**Linux:**
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+### Project structure
 
 ```
 main.cpp        SDL3 app: Vulkan device, libplacebo swapchain/renderer, event loop
@@ -109,6 +122,15 @@ packs/          Bundled user-shader packs (Anime4K) copied next to the exe
 shaders/        First-party shaders (e.g. greyscale test)
 tests/          Sample video (git-lfs)
 ```
+
+### Command-line options
+
+```
+codotaku_video_player [video-file] [--shader <file>]
+```
+
+- `video-file` — optional; if omitted, a bundled test clip plays (dev builds)
+- `--shader <file>` — load an mpv-style shader pack at startup
 
 ## License
 
