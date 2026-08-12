@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <exception>
 #include <format>
+#include <optional>
 #include <print>
 #include <source_location>
 #include <stdexcept>
@@ -34,6 +35,7 @@ extern "C" {
 #include <libplacebo/utils/libav.h>
 #include <libplacebo/vulkan.h>
 
+#include "annotations.h"
 #include "player.h"
 #include "sync.h"
 
@@ -110,6 +112,33 @@ struct App {
   // When a seek lands while paused, one frame is decoded and shown so the new
   // position is visible without resuming playback.
   bool pending_seek_redraw = false;
+
+  // --- Annotations --------------------------------------------------------
+  // Timeline of user drawings; committed items persist between frames until
+  // the user removes them (which records the removal timestamp for export).
+  AnnoStore annotations;
+  AnnoRaster raster;
+  // Active editing tool; nullopt == cursor mode (left-click seeks).
+  std::optional<AnnoShape> tool;
+  int color_idx = 0;
+  bool drawing = false;             // left-drag in progress
+  AnnoPoint draw_anchor{};          // drag start (normalized video coords)
+  AnnoPoint draw_cur{};             // current mouse pos (normalized video coords)
+  std::vector<AnnoPoint> draw_pts;  // freehand polyline being drawn
+  std::string text_buffer;          // pending text for the Text tool
+
+  // GPU overlay pipeline: video is composited (with shaders) into an offscreen
+  // texture, the CPU-rasterized annotation overlay is uploaded on top of it,
+  // and a final pass blends the two into the swapchain FBO.
+  pl_tex video_tex = nullptr;
+  pl_tex overlay_tex = nullptr;
+  pl_pass blend_pass = nullptr;
+  int overlay_w = 0;
+  int overlay_h = 0;
+  pl_fmt overlay_video_fmt = nullptr;
+  // Last aspect-corrected video display rectangle, in window pixels (y-down).
+  // Used to map mouse input to normalized video coordinates.
+  pl_rect2df video_rect{};
 };
 
 auto append_ext(std::string &buf, const char *ext) -> void {
@@ -344,6 +373,252 @@ auto load_shader(App &app, const char *path) -> bool {
   return true;
 }
 
+// --- Annotation overlay pipeline ----------------------------------------
+// The video (with shaders) is composited into an offscreen texture, the
+// CPU-rasterized annotation overlay is uploaded as a second texture, and a
+// final pass blends the two into the swapchain FBO. This keeps annotation
+// geometry in normalized video space (resolution-independent) and leaves a
+// clean seam for the future export feature, which can run the same two passes
+// into an offscreen texture instead of the swapchain.
+
+constexpr float kAnnoColors[][3] = {
+    {1.00f, 0.30f, 0.30f}, {0.35f, 1.00f, 0.45f}, {0.35f, 0.65f, 1.00f},
+    {1.00f, 0.85f, 0.25f}, {1.00f, 0.55f, 0.95f}, {0.35f, 1.00f, 1.00f},
+    {1.00f, 1.00f, 1.00f}, {0.90f, 0.45f, 0.20f},
+};
+
+auto anno_color(const App &app) -> const float * {
+  return kAnnoColors[app.color_idx %
+                     (sizeof(kAnnoColors) / sizeof(kAnnoColors[0]))];
+}
+
+// Media time used to anchor annotations (appear time / removal time).
+auto anno_time(const App &app) -> double {
+  double t = get_master_clock(app);
+  if (std::isnan(t))
+    t = clock_get(app.vidclk);
+  return std::isnan(t) ? 0.0 : t;
+}
+
+auto tool_name(AnnoShape s) -> std::string_view {
+  switch (s) {
+    case AnnoShape::Rect: return "rect";
+    case AnnoShape::Ellipse: return "ellipse";
+    case AnnoShape::Arrow: return "arrow";
+    case AnnoShape::Freehand: return "freehand";
+    case AnnoShape::Text: return "text";
+  }
+  return "?";
+}
+
+// Map a window-space point (pixels, y-down) to normalized video coordinates.
+auto window_to_anno(const App &app, float x, float y) -> AnnoPoint {
+  float rw = app.video_rect.x1 - app.video_rect.x0;
+  float rh = app.video_rect.y1 - app.video_rect.y0;
+  if (rw <= 0.0f || rh <= 0.0f)
+    return {};
+  AnnoPoint p;
+  p.x = std::clamp((x - app.video_rect.x0) / rw, 0.0f, 1.0f);
+  p.y = std::clamp((y - app.video_rect.y0) / rh, 0.0f, 1.0f);
+  return p;
+}
+
+struct OverlayVtx {
+  float x;
+  float y;
+  float _pad[2];  // keep the vertex stride a multiple of any GPU alignment
+};
+
+// (Re)create the offscreen video texture, the overlay texture, and the blend
+// pass whenever the swapchain changes size or format.
+auto ensure_overlay_resources(App &app, pl_fmt fbo_fmt, int w, int h) -> void {
+  if (app.video_tex != nullptr && app.overlay_w == w && app.overlay_h == h &&
+      app.overlay_video_fmt == fbo_fmt)
+    return;
+  std::println(stderr, "annotation: recreating overlay resources ({}x{} fmt={})",
+               w, h, fbo_fmt != nullptr ? fbo_fmt->name : "?");
+
+  if (app.video_tex != nullptr)
+    pl_tex_destroy(app.gpu, &app.video_tex);
+  if (app.overlay_tex != nullptr)
+    pl_tex_destroy(app.gpu, &app.overlay_tex);
+  if (app.blend_pass != nullptr)
+    pl_pass_destroy(app.gpu, &app.blend_pass);
+  app.video_tex = nullptr;
+  app.overlay_tex = nullptr;
+  app.blend_pass = nullptr;
+  app.overlay_w = w;
+  app.overlay_h = h;
+  app.overlay_video_fmt = fbo_fmt;
+
+  // Same format as the swapchain FBO so the colors rendered by libplacebo
+  // stay byte-identical to the old direct-to-FBO path. The renderer clears the
+  // letterbox border of the target via a blit, so the format also needs
+  // PL_FMT_CAP_BLITTABLE.
+  auto video_fmt_ok = [](pl_fmt f) {
+    constexpr int need = PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE |
+                         PL_FMT_CAP_BLITTABLE;
+    return f != nullptr && (f->caps & need) == need;
+  };
+  pl_fmt video_fmt = nullptr;
+  if (video_fmt_ok(fbo_fmt))
+    video_fmt = fbo_fmt;
+  if (!video_fmt_ok(video_fmt))
+    video_fmt = pl_find_named_fmt(app.gpu, "rgba16f");
+  if (!video_fmt_ok(video_fmt))
+    video_fmt = pl_find_named_fmt(app.gpu, "rgba8");
+  if (!video_fmt_ok(video_fmt)) {
+    std::println(stderr, "annotation: no renderable/blittable video format");
+    return;
+  }
+  struct pl_tex_params vp = {};
+  vp.w = w;
+  vp.h = h;
+  vp.format = video_fmt;
+  vp.sampleable = true;
+  vp.renderable = true;
+  vp.blit_dst = true;
+  app.video_tex = pl_tex_create(app.gpu, &vp);
+
+  pl_fmt ov_fmt = pl_find_named_fmt(app.gpu, "rgba8");
+  if (ov_fmt == nullptr || !(ov_fmt->caps & PL_FMT_CAP_SAMPLEABLE)) {
+    std::println(stderr, "annotation: no sampleable RGBA format");
+    return;
+  }
+  struct pl_tex_params op = {};
+  op.w = w;
+  op.h = h;
+  op.format = ov_fmt;
+  op.sampleable = true;
+  op.host_writable = true;
+  app.overlay_tex = pl_tex_create(app.gpu, &op);
+
+  if (app.video_tex == nullptr || app.overlay_tex == nullptr) {
+    std::println(stderr, "annotation: failed to create overlay textures");
+    return;
+  }
+
+  static const char *kVertexShader = R"glsl(
+#version 450
+layout(location = 0) in vec2 pos;
+void main() {
+  gl_Position = vec4(pos, 0.0, 1.0);
+}
+)glsl";
+  static const char *kFragmentShader = R"glsl(
+#version 450
+layout(binding = 0) uniform sampler2D video_tex;
+layout(binding = 1) uniform sampler2D overlay_tex;
+layout(push_constant) uniform Push {
+  vec2 resolution;
+} push;
+layout(location = 0) out vec4 out_color;
+void main() {
+  vec2 uv = gl_FragCoord.xy / push.resolution;
+  vec4 video = texture(video_tex, uv);
+  vec4 ov = texture(overlay_tex, uv);
+  vec3 rgb = video.rgb * (1.0 - ov.a) + ov.rgb * ov.a;
+  out_color = vec4(rgb, video.a);
+}
+)glsl";
+
+  pl_fmt pos_fmt = pl_find_fmt(app.gpu, PL_FMT_FLOAT, 2, 32, 0,
+                               PL_FMT_CAP_VERTEX);
+  if (pos_fmt == nullptr) {
+    std::println(stderr, "annotation: no vertex format");
+    return;
+  }
+  struct pl_vertex_attrib va = {
+      .name = "pos",
+      .fmt = pos_fmt,
+      .offset = 0,
+      .location = 0,
+  };
+  struct pl_desc descs[2] = {
+      {.name = "video_tex", .type = PL_DESC_SAMPLED_TEX, .binding = 0},
+      {.name = "overlay_tex", .type = PL_DESC_SAMPLED_TEX, .binding = 1},
+  };
+  pl_fmt target_fmt = fbo_fmt;
+  if (target_fmt == nullptr || !(target_fmt->caps & PL_FMT_CAP_RENDERABLE))
+    target_fmt = video_fmt;
+
+  struct pl_pass_params pp = {};
+  pp.type = PL_PASS_RASTER;
+  pp.descriptors = descs;
+  pp.num_descriptors = 2;
+  pp.push_constants_size = sizeof(float) * 2;
+  pp.glsl_shader = kFragmentShader;
+  pp.vertex_type = PL_PRIM_TRIANGLE_LIST;
+  pp.vertex_attribs = &va;
+  pp.num_vertex_attribs = 1;
+  pp.vertex_stride = sizeof(OverlayVtx);
+  pp.vertex_shader = kVertexShader;
+  pp.target_format = target_fmt;
+  pp.load_target = false;
+  app.blend_pass = pl_pass_create(app.gpu, &pp);
+  if (app.blend_pass == nullptr)
+    std::println(stderr, "annotation: failed to create blend pass");
+}
+
+// Upload the rasterized overlay and blend it over the video into `target`.
+auto blend_overlay(App &app, pl_tex target) -> void {
+  if (app.blend_pass == nullptr || app.video_tex == nullptr ||
+      app.overlay_tex == nullptr)
+    return;
+
+  double t = anno_time(app);
+  app.raster.resize(app.overlay_w, app.overlay_h);
+  app.raster.set_display_rect(
+      static_cast<int>(app.video_rect.x0), static_cast<int>(app.video_rect.y0),
+      static_cast<int>(std::ceil(app.video_rect.x1 - app.video_rect.x0)),
+      static_cast<int>(std::ceil(app.video_rect.y1 - app.video_rect.y0)));
+  app.raster.clear();
+  for (const Annotation &a : app.annotations.items)
+    if (a.visible_at(t))
+      app.raster.draw_annotation(a);
+
+  if (app.drawing && app.tool.has_value()) {
+    Annotation preview{};
+    preview.shape = *app.tool;
+    const float *c = anno_color(app);
+    preview.color[0] = c[0];
+    preview.color[1] = c[1];
+    preview.color[2] = c[2];
+    preview.color[3] = 0.6f;
+    preview.pts = *app.tool == AnnoShape::Freehand
+                      ? app.draw_pts
+                      : std::vector<AnnoPoint>{app.draw_anchor, app.draw_cur};
+    preview.text = app.text_buffer;
+    app.raster.draw_annotation(preview);
+  }
+
+  struct pl_tex_transfer_params upload = {};
+  upload.tex = app.overlay_tex;
+  upload.row_pitch = static_cast<size_t>(app.overlay_w) * 4;
+  upload.ptr = app.raster.buf.data();
+  pl_tex_upload(app.gpu, &upload);
+
+  static const OverlayVtx kTri[3] = {
+      {-1.0f, -1.0f, {}}, {3.0f, -1.0f, {}}, {-1.0f, 3.0f, {}},
+  };
+  struct pl_desc_binding bindings[2] = {
+      {.object = app.video_tex, .address_mode = PL_TEX_ADDRESS_CLAMP,
+       .sample_mode = PL_TEX_SAMPLE_NEAREST},
+      {.object = app.overlay_tex, .address_mode = PL_TEX_ADDRESS_CLAMP,
+       .sample_mode = PL_TEX_SAMPLE_NEAREST},
+  };
+  float resolution[2] = {static_cast<float>(app.overlay_w),
+                         static_cast<float>(app.overlay_h)};
+  struct pl_pass_run_params run = {};
+  run.pass = app.blend_pass;
+  run.desc_bindings = bindings;
+  run.push_constants = resolution;
+  run.target = target;
+  run.vertex_data = kTri;
+  run.vertex_count = 3;
+  pl_pass_run(app.gpu, &run);
+}
+
 // Composite a decoded frame into an already-resolved target frame (e.g. the
 // current swapchain FBO). This is the seam between compositing and
 // presentation: everything libplacebo needs is passed as data, so the same
@@ -396,8 +671,30 @@ auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
     params.num_hooks = static_cast<int>(app.hooks.size());
   }
 
-  if (!composite_frame(app, frame, &target, &params))
-    return SDL_APP_FAILURE;
+  int w = sw.fbo->params.w;
+  int h = sw.fbo->params.h;
+  ensure_overlay_resources(app, sw.fbo->params.format, w, h);
+
+  if (app.video_tex == nullptr || app.overlay_tex == nullptr) {
+    // Fallback: composite straight into the swapchain FBO (no overlay).
+    if (!composite_frame(app, frame, &target, &params))
+      return SDL_APP_FAILURE;
+    app.video_rect = target.crop;
+  } else {
+    // Pass 1: video + shaders -> offscreen texture.
+    struct pl_frame vtarget = target;
+    vtarget.planes[0].texture = app.video_tex;
+    vtarget.planes[0].flipped = false;
+    vtarget.num_planes = 1;
+    vtarget.crop = {0.0f, 0.0f, static_cast<float>(w),
+                    static_cast<float>(h)};
+    if (!composite_frame(app, frame, &vtarget, &params))
+      return SDL_APP_FAILURE;
+    app.video_rect = vtarget.crop;
+
+    // Pass 2: rasterize annotations and blend them over the video.
+    blend_overlay(app, sw.fbo);
+  }
 
   if (!pl_swapchain_submit_frame(app.swapchain)) {
     std::println(stderr, "pl_swapchain_submit_frame failed");
@@ -711,9 +1008,38 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       pl_swapchain_resize(app->swapchain, &w, &h);
     break;
   }
-  case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    if (event->button.button == SDL_BUTTON_LEFT) {
-      auto *app = static_cast<App *>(appstate);
+  case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+    auto *app = static_cast<App *>(appstate);
+    if (event->button.button != SDL_BUTTON_LEFT)
+      break;
+    if (app->tool.has_value()) {
+      AnnoPoint p = window_to_anno(*app, event->button.x, event->button.y);
+      if (*app->tool == AnnoShape::Text) {
+        if (!app->text_buffer.empty()) {
+          Annotation a{};
+          a.shape = AnnoShape::Text;
+          const float *c = anno_color(*app);
+          a.color[0] = c[0];
+          a.color[1] = c[1];
+          a.color[2] = c[2];
+          a.color[3] = 1.0f;
+          a.pts = {p};
+          a.text = app->text_buffer;
+          a.start_pts = anno_time(*app);
+          int id = app->annotations.add(std::move(a));
+          std::println(stderr,
+                       "annotation: text id={} at {:.2f}s text='{}' len={} "
+                       "pos=({:.3f},{:.3f})",
+                       id, anno_time(*app), app->text_buffer,
+                       app->text_buffer.size(), p.x, p.y);
+        }
+      } else {
+        app->drawing = true;
+        app->draw_anchor = p;
+        app->draw_cur = p;
+        app->draw_pts = {p};
+      }
+    } else {
       double dur = app->player.duration();
       if (dur <= 0.0) {
         std::println(stderr, "seek: duration unknown");
@@ -726,9 +1052,86 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       seek_app(*app, dur * static_cast<double>(event->button.x) / w);
     }
     break;
+  }
+  case SDL_EVENT_MOUSE_BUTTON_UP: {
+    auto *app = static_cast<App *>(appstate);
+    if (event->button.button == SDL_BUTTON_LEFT && app->drawing) {
+      app->drawing = false;
+      AnnoPoint p = window_to_anno(*app, event->button.x, event->button.y);
+      app->draw_cur = p;
+      Annotation a{};
+      a.shape = *app->tool;
+      const float *c = anno_color(*app);
+      a.color[0] = c[0];
+      a.color[1] = c[1];
+      a.color[2] = c[2];
+      a.color[3] = 1.0f;
+      a.pts = a.shape == AnnoShape::Freehand
+                  ? app->draw_pts
+                  : std::vector<AnnoPoint>{app->draw_anchor, p};
+      if (a.pts.size() >= 2) {
+        float dx = a.pts.back().x - a.pts.front().x;
+        float dy = a.pts.back().y - a.pts.front().y;
+        if (std::hypot(dx, dy) > 0.001f) {
+          a.start_pts = anno_time(*app);
+          int id = app->annotations.add(std::move(a));
+          std::println(stderr, "annotation: {} id={} at {:.2f}s",
+                       tool_name(a.shape), id, anno_time(*app));
+        }
+      }
+    }
+    break;
+  }
+  case SDL_EVENT_MOUSE_MOTION: {
+    auto *app = static_cast<App *>(appstate);
+    if (app->drawing && app->tool.has_value()) {
+      app->draw_cur = window_to_anno(*app, event->motion.x, event->motion.y);
+      if (*app->tool == AnnoShape::Freehand) {
+        AnnoPoint &last = app->draw_pts.back();
+        if (std::hypot(app->draw_cur.x - last.x, app->draw_cur.y - last.y) >
+            0.002f)
+          app->draw_pts.push_back(app->draw_cur);
+      }
+    }
+    break;
+  }
+  case SDL_EVENT_TEXT_INPUT: {
+    auto *app = static_cast<App *>(appstate);
+    if (app->tool.has_value() && *app->tool == AnnoShape::Text) {
+      app->text_buffer += event->text.text;
+      std::println(stderr, "text-input: got='{}' len={} buffer='{}'",
+                   event->text.text, app->text_buffer.size(),
+                   app->text_buffer);
+    }
+    break;
+  }
   case SDL_EVENT_KEY_DOWN: {
     auto *app = static_cast<App *>(appstate);
-    if (event->key.key == SDLK_SPACE) {
+    const bool in_text =
+        app->tool.has_value() && *app->tool == AnnoShape::Text;
+    if (in_text && event->key.key == SDLK_ESCAPE) {
+      SDL_StopTextInput(app->window);
+      std::println(stderr, "text: escape, buffer '{}' discarded",
+                   app->text_buffer);
+      app->tool.reset();
+      app->drawing = false;
+      app->text_buffer.clear();
+      std::println(stderr, "annotation tool: none");
+    } else if (in_text && event->key.key == SDLK_RETURN) {
+      std::println(stderr, "text: enter clears buffer '{}'", app->text_buffer);
+      app->text_buffer.clear();
+      std::println(stderr, "annotation text: (cleared)");
+    } else if (in_text && event->key.key == SDLK_BACKSPACE) {
+      if (!app->text_buffer.empty()) {
+        std::println(stderr, "text: backspace '{}' -> '{}'",
+                     app->text_buffer.back(), app->text_buffer);
+        app->text_buffer.pop_back();
+        std::println(stderr, "text: buffer now '{}'", app->text_buffer);
+      }
+    } else if (in_text) {
+      // Text mode swallows all other shortcuts; characters arrive via
+      // SDL_EVENT_TEXT_INPUT so they must not toggle tools/pause/etc.
+    } else if (event->key.key == SDLK_SPACE) {
       app->paused = !app->paused;
       // Freeze the video clock while paused so it doesn't keep drifting with
       // wall time; re-prime pacing when playback resumes.
@@ -755,6 +1158,61 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       if (std::isnan(t))
         t = 0.0;
       seek_app(*app, t + (event->key.key == SDLK_LEFT ? -10.0 : 10.0));
+    } else if (event->key.key == SDLK_R || event->key.key == SDLK_E ||
+               event->key.key == SDLK_A || event->key.key == SDLK_F ||
+               event->key.key == SDLK_T) {
+      AnnoShape shape = event->key.key == SDLK_R
+                            ? AnnoShape::Rect
+                            : event->key.key == SDLK_E
+                                  ? AnnoShape::Ellipse
+                                  : event->key.key == SDLK_A
+                                        ? AnnoShape::Arrow
+                                        : event->key.key == SDLK_F
+                                              ? AnnoShape::Freehand
+                                              : AnnoShape::Text;
+      app->tool = (app->tool.has_value() && *app->tool == shape)
+                      ? std::nullopt
+                      : std::optional(shape);
+      if (shape == AnnoShape::Text) {
+        if (app->tool.has_value()) {
+          SDL_StartTextInput(app->window);
+          std::println(stderr, "text: input started (tool=text)");
+        } else {
+          SDL_StopTextInput(app->window);
+          std::println(stderr, "text: input stopped (tool=none)");
+        }
+      }
+      std::println(stderr, "annotation tool: {}",
+                   app->tool ? tool_name(*app->tool) : "none");
+    } else if (event->key.key == SDLK_C) {
+      app->color_idx = (app->color_idx + 1) %
+                       (sizeof(kAnnoColors) / sizeof(kAnnoColors[0]));
+      std::println(stderr, "annotation color: {}", app->color_idx);
+    } else if (event->key.key == SDLK_ESCAPE) {
+      if (app->tool.has_value()) {
+        app->tool.reset();
+        app->drawing = false;
+        app->text_buffer.clear();
+        std::println(stderr, "annotation tool: none");
+      }
+    } else if (event->key.key == SDLK_BACKSPACE) {
+      int id = app->annotations.last_id();
+      if (id >= 0) {
+        double t = anno_time(*app);
+        app->annotations.remove_at(t, id);
+        std::println(stderr, "annotation: removed id={} at {:.2f}s", id, t);
+      }
+    } else if (event->key.key == SDLK_DELETE) {
+      float mx = 0.0f;
+      float my = 0.0f;
+      SDL_GetMouseState(&mx, &my);
+      AnnoPoint p = window_to_anno(*app, mx, my);
+      double t = anno_time(*app);
+      int id = app->annotations.hit_test(p, t);
+      if (id >= 0) {
+        app->annotations.remove_at(t, id);
+        std::println(stderr, "annotation: removed id={} at {:.2f}s", id, t);
+      }
     }
     break;
   }
@@ -776,9 +1234,16 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) try {
   for (const pl_hook *hook : app->hooks)
     pl_mpv_user_shader_destroy(&hook);
   app->hooks.clear();
-  if (app->gpu != nullptr)
+  if (app->gpu != nullptr) {
     for (auto &tex : app->frame_tex)
       pl_tex_destroy(app->gpu, &tex);
+    if (app->video_tex != nullptr)
+      pl_tex_destroy(app->gpu, &app->video_tex);
+    if (app->overlay_tex != nullptr)
+      pl_tex_destroy(app->gpu, &app->overlay_tex);
+    if (app->blend_pass != nullptr)
+      pl_pass_destroy(app->gpu, &app->blend_pass);
+  }
   if (app->swapchain != nullptr)
     pl_swapchain_destroy(&app->swapchain);
   if (app->surface != VK_NULL_HANDLE)
