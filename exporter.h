@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -58,7 +59,14 @@ class Exporter {
   bool setup_audio(const AVRational &audio_time_base,
                    const AVCodecParameters *audio_par);
   void encode_audio_frame(AVFrame *decoded);
+  void drain_audio_resampler();
+  bool ensure_aconv_buffer(int frame_size);
   void drain_audio_encoder();
+  void abort_muxer();
+  void fifo_append(const uint8_t *const *planes, int nb);
+  bool fifo_pop_into(AVFrame *frame, int nb);
+  bool emit_fifo_frame(int nb);
+  int aenc_frame_size() const;
 
   std::string path_;
   AVFormatContext *ofmt_ = nullptr;
@@ -83,4 +91,12 @@ class Exporter {
   AVFrame *aconv_ = nullptr;     // resampled frame fed to the AAC encoder
   AVPacket *apkt_ = nullptr;     // encoded audio packet
   int64_t aout_pts_ = 0;         // running pts fallback for NOPTS input
+
+  // Staging FIFO of resampled (fltp) samples: interleaved by
+  // [sample][channel]. AAC only accepts exactly frame_size samples per frame
+  // (one undersized last frame is tolerated), so decoded frames of any size
+  // are accumulated here and emitted only in full chunks.
+  std::vector<float> aout_fifo_;
+  int aout_fifo_samples_ = 0;
+  int64_t aout_fifo_pts_ = 0;    // pts of the first sample in the FIFO
 };

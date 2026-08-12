@@ -38,6 +38,20 @@ auto av_err_str(int err) -> std::string {
 
 Exporter::~Exporter() { close(false); }
 
+// Tear down just the muxer/output context. Unlike close(), this leaves the
+// encoder, resampler, and sws contexts alive so open() can retry video-only
+// after an audio muxing failure (close() frees those, which would leave the
+// retry using dangling venc_).
+void Exporter::abort_muxer() {
+  if (ofmt_ != nullptr && !(ofmt_->oformat->flags & AVFMT_NOFILE) &&
+      ofmt_->pb != nullptr)
+    avio_closep(&ofmt_->pb);
+  avformat_free_context(ofmt_);
+  ofmt_ = nullptr;
+  vstream_ = nullptr;
+  astream_ = nullptr;
+}
+
 bool Exporter::try_open(const AVRational &audio_time_base,
                         const AVCodecParameters *audio_par) {
   int ret = avformat_alloc_output_context2(&ofmt_, nullptr, "mp4",
@@ -49,7 +63,7 @@ bool Exporter::try_open(const AVRational &audio_time_base,
 
   vstream_ = avformat_new_stream(ofmt_, nullptr);
   if (vstream_ == nullptr) {
-    close(false);
+    abort_muxer();
     return false;
   }
   vstream_->id = 0;
@@ -57,21 +71,21 @@ bool Exporter::try_open(const AVRational &audio_time_base,
   vstream_->sample_aspect_ratio = venc_->sample_aspect_ratio;
   ret = avcodec_parameters_from_context(vstream_->codecpar, venc_);
   if (ret < 0) {
-    close(false);
+    abort_muxer();
     return false;
   }
 
   if (audio_active_ && aenc_ != nullptr) {
     astream_ = avformat_new_stream(ofmt_, nullptr);
     if (astream_ == nullptr) {
-      close(false);
+      abort_muxer();
       return false;
     }
     astream_->id = 1;
     astream_->time_base = aenc_->time_base;
     ret = avcodec_parameters_from_context(astream_->codecpar, aenc_);
     if (ret < 0) {
-      close(false);
+      abort_muxer();
       return false;
     }
   }
@@ -79,14 +93,14 @@ bool Exporter::try_open(const AVRational &audio_time_base,
   if (!(ofmt_->oformat->flags & AVFMT_NOFILE)) {
     ret = avio_open(&ofmt_->pb, path_.c_str(), AVIO_FLAG_WRITE);
     if (ret < 0) {
-      close(false);
+      abort_muxer();
       return false;
     }
   }
 
   ret = avformat_write_header(ofmt_, nullptr);
   if (ret < 0) {
-    close(false);
+    abort_muxer();
     return false;
   }
   return true;
@@ -271,25 +285,149 @@ bool Exporter::setup_audio(const AVRational &audio_time_base,
   return true;
 }
 
+bool Exporter::ensure_aconv_buffer(int frame_size) {
+  if (aconv_->data[0] != nullptr)
+    return true;
+  aconv_->nb_samples = frame_size;
+  aconv_->format = AV_SAMPLE_FMT_FLTP;
+  aconv_->sample_rate = aenc_->sample_rate;
+  if (av_channel_layout_copy(&aconv_->ch_layout, &aenc_->ch_layout) < 0)
+    return false;
+  return av_frame_get_buffer(aconv_, 0) >= 0;
+}
+
+// Append `nb` resampled (fltp, planar) samples to the staging FIFO. The FIFO
+// holds [sample][channel], matching the aconv_ frame layout.
+void Exporter::fifo_append(const uint8_t *const *planes, int nb) {
+  int ch = aenc_ != nullptr ? aenc_->ch_layout.nb_channels : 0;
+  if (ch <= 0 || nb <= 0)
+    return;
+  size_t base = static_cast<size_t>(aout_fifo_samples_) * ch;
+  aout_fifo_.resize(base + static_cast<size_t>(nb) * ch);
+  for (int c = 0; c < ch; c++) {
+    const float *plane = reinterpret_cast<const float *>(planes[c]);
+    for (int i = 0; i < nb; i++)
+      aout_fifo_[base + static_cast<size_t>(i) * ch + c] = plane[i];
+  }
+  aout_fifo_samples_ += nb;
+}
+
+// Pop the oldest `nb` samples out of the FIFO into `frame` (which must be
+// allocated with at least frame_size samples of capacity).
+bool Exporter::fifo_pop_into(AVFrame *frame, int nb) {
+  int ch = aenc_ != nullptr ? aenc_->ch_layout.nb_channels : 0;
+  if (ch <= 0 || aout_fifo_samples_ < nb)
+    return false;
+  for (int c = 0; c < ch; c++) {
+    float *dst = reinterpret_cast<float *>(frame->data[c]);
+    for (int i = 0; i < nb; i++)
+      dst[i] = aout_fifo_[static_cast<size_t>(i) * ch + c];
+  }
+  int rem = aout_fifo_samples_ - nb;
+  for (int i = 0; i < rem; i++)
+    for (int c = 0; c < ch; c++)
+      aout_fifo_[static_cast<size_t>(i) * ch + c] =
+          aout_fifo_[(static_cast<size_t>(i) + nb) * ch + c];
+  aout_fifo_samples_ = rem;
+  aout_fifo_.resize(static_cast<size_t>(rem) * ch);
+  return true;
+}
+
+int Exporter::aenc_frame_size() const {
+  return aenc_ != nullptr && aenc_->frame_size > 0 ? aenc_->frame_size : 1024;
+}
+
+// Send the next `nb` FIFO samples to the AAC encoder as one frame. The AAC
+// encoder accepts exactly frame_size samples per frame, plus one undersized
+// last frame; callers must only pass nb < frame_size for that final frame.
+bool Exporter::emit_fifo_frame(int nb) {
+  if (aenc_ == nullptr || astream_ == nullptr || aout_fifo_samples_ < nb)
+    return false;
+  int frame_size = aenc_frame_size();
+  if (!ensure_aconv_buffer(frame_size))
+    return false;
+  if (!fifo_pop_into(aconv_, nb))
+    return false;
+  aconv_->nb_samples = nb;
+  aconv_->pts = aout_fifo_pts_;
+  aout_fifo_pts_ += nb;
+  aout_pts_ = aout_fifo_pts_;
+  int send_ret = avcodec_send_frame(aenc_, aconv_);
+  if (send_ret < 0) {
+    std::println(stderr,
+                 "export: avcodec_send_frame (audio): {} (frame fmt={} ch={} "
+                 "n={} rate={})",
+                 av_err_str(send_ret),
+                 av_get_sample_fmt_name(static_cast<AVSampleFormat>(aconv_->format)),
+                 aconv_->ch_layout.nb_channels, aconv_->nb_samples,
+                 aconv_->sample_rate);
+    return false;
+  }
+  drain_audio_encoder();
+  return true;
+}
+
+// Drain whatever the resampler still holds after the last decoded frame so
+// trailing samples reach the FIFO (up to one frame's worth).
+void Exporter::drain_audio_resampler() {
+  if (aswr_ == nullptr || aenc_ == nullptr || astream_ == nullptr)
+    return;
+  int frame_size = aenc_frame_size();
+  for (;;) {
+    if (!ensure_aconv_buffer(frame_size))
+      return;
+    int got = swr_convert(aswr_, aconv_->data, frame_size, nullptr, 0);
+    if (got <= 0)
+      break;
+    fifo_append(aconv_->data, got);
+    if (got < frame_size)
+      break;
+  }
+}
+
 void Exporter::encode_audio_frame(AVFrame *decoded) {
   if (aenc_ == nullptr || astream_ == nullptr)
     return;
-  if (swr_convert_frame(aswr_, aconv_, decoded) < 0) {
-    std::println(stderr, "export: audio resample failed");
-    return;
-  }
+  // The AAC encoder has a fixed frame_size (1024 samples), but the decoder's
+  // frames can be any size (AC3 = 1536, MP2 = 1152, ...). Feeding a whole
+  // decoded frame at once fails with "nb_samples > frame_size", and feeding an
+  // undersized chunk mid-stream permanently poisons the encoder ("frame_size
+  // was not respected for a non-last frame"). So every decoded frame is
+  // resampled into a persistent FIFO and only full frame_size chunks are
+  // emitted; any leftover (< frame_size) samples are flushed once in finish()
+  // as the final, undersized frame.
+  int frame_size = aenc_frame_size();
+  bool fifo_was_empty = aout_fifo_samples_ == 0;
+
   int64_t pts = AV_NOPTS_VALUE;
   if (decoded->pts != AV_NOPTS_VALUE)
     pts = av_rescale_q(decoded->pts, asrc_tb_, aenc_->time_base);
-  if (pts == AV_NOPTS_VALUE)
-    pts = aout_pts_;
-  aout_pts_ = pts + std::max(0, aconv_->nb_samples);
-  aconv_->pts = pts;
-  if (avcodec_send_frame(aenc_, aconv_) < 0) {
-    std::println(stderr, "export: avcodec_send_frame (audio) failed");
-    return;
+
+  // swr_convert consumes the whole input frame at once and buffers the excess
+  // internally; pull it out in frame_size-sized batches into the FIFO.
+  int in_samples = decoded->nb_samples;
+  for (;;) {
+    if (!ensure_aconv_buffer(frame_size))
+      return;
+    int got = swr_convert(aswr_, aconv_->data, frame_size,
+                          in_samples > 0
+                              ? const_cast<const uint8_t **>(decoded->data)
+                              : nullptr,
+                          in_samples);
+    if (got <= 0)
+      break;
+    in_samples = 0;
+    if (fifo_was_empty) {
+      aout_fifo_pts_ = pts != AV_NOPTS_VALUE ? pts : aout_pts_;
+      fifo_was_empty = false;
+    }
+    fifo_append(aconv_->data, got);
+    if (got < frame_size)
+      break;
   }
-  drain_audio_encoder();
+
+  while (aout_fifo_samples_ >= frame_size)
+    emit_fifo_frame(frame_size);
 }
 
 void Exporter::drain_audio_encoder() {
@@ -384,7 +522,15 @@ void Exporter::finish() {
     }
     av_frame_free(&decoded);
   }
+  drain_audio_resampler();
   if (aenc_ != nullptr) {
+    // Emit whatever is left in the FIFO: full frames first, then the leftover
+    // (< frame_size) samples as the single undersized final frame AAC allows.
+    int frame_size = aenc_frame_size();
+    while (aout_fifo_samples_ >= frame_size)
+      emit_fifo_frame(frame_size);
+    if (aout_fifo_samples_ > 0)
+      emit_fifo_frame(aout_fifo_samples_);
     avcodec_send_frame(aenc_, nullptr);  // flush buffered audio
     drain_audio_encoder();
   }
