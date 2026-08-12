@@ -140,6 +140,9 @@ struct App {
   // Last aspect-corrected video display rectangle, in window pixels (y-down).
   // Used to map mouse input to normalized video coordinates.
   pl_rect2df video_rect{};
+  // Set whenever annotation state changes; the paused branch of SDL_AppIterate
+  // consumes it to re-blend the overlay onto the last composited video frame.
+  bool overlay_dirty = false;
 
   // --- Export -------------------------------------------------------------
   // The exporter is non-null while an export is running; SDL_AppIterate then
@@ -651,6 +654,30 @@ auto blend_overlay(App &app, pl_tex target) -> void {
 
   run_overlay_blend(app, app.blend_pass, app.video_tex, app.overlay_tex,
                     target, app.raster);
+}
+
+// Re-render just the annotation overlay while paused. `video_tex` already
+// holds the last composited video frame, so only the blend pass needs to run
+// again — no decode is required.
+auto redraw_overlay(App &app) -> void {
+  if (app.video_tex == nullptr || app.overlay_tex == nullptr ||
+      app.blend_pass == nullptr)
+    return;
+  struct pl_swapchain_frame sw {};
+  if (!pl_swapchain_start_frame(app.swapchain, &sw)) {
+    std::println(stderr, "pl_swapchain_start_frame failed");
+    return;
+  }
+  // If the window was resized while paused, the cached overlay textures no
+  // longer match the swapchain FBO; leave the redraw to the next render_frame
+  // (triggered by the resize handler) instead of blending a stale-size overlay.
+  if (sw.fbo->params.w == app.overlay_w && sw.fbo->params.h == app.overlay_h)
+    blend_overlay(app, sw.fbo);
+  if (!pl_swapchain_submit_frame(app.swapchain)) {
+    std::println(stderr, "pl_swapchain_submit_frame failed");
+    return;
+  }
+  pl_swapchain_swap_buffers(app.swapchain);
 }
 
 // Composite a decoded frame into an already-resolved target frame (e.g. the
@@ -1195,6 +1222,11 @@ auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
         app->prev_frame_pts = pts;
         av_frame_free(&frame);
       }
+    } else if (app->overlay_dirty) {
+      // Annotations changed while paused; re-blend them over the frame that is
+      // already on screen without decoding a new one.
+      app->overlay_dirty = false;
+      redraw_overlay(*app);
     } else {
       SDL_Delay(16);
     }
@@ -1339,6 +1371,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
           a.text = app->text_buffer;
           a.start_pts = anno_time(*app);
           int id = app->annotations.add(std::move(a));
+          app->overlay_dirty = true;
           std::println(stderr,
                        "annotation: text id={} at {:.2f}s text='{}' len={} "
                        "pos=({:.3f},{:.3f})",
@@ -1350,6 +1383,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         app->draw_anchor = p;
         app->draw_cur = p;
         app->draw_pts = {p};
+        app->overlay_dirty = true;
       }
     } else {
       double dur = app->player.duration();
@@ -1387,6 +1421,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         if (std::hypot(dx, dy) > 0.001f) {
           a.start_pts = anno_time(*app);
           int id = app->annotations.add(std::move(a));
+          app->overlay_dirty = true;
           std::println(stderr, "annotation: {} id={} at {:.2f}s",
                        tool_name(a.shape), id, anno_time(*app));
         }
@@ -1398,6 +1433,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
     auto *app = static_cast<App *>(appstate);
     if (app->drawing && app->tool.has_value()) {
       app->draw_cur = window_to_anno(*app, event->motion.x, event->motion.y);
+      app->overlay_dirty = true;
       if (*app->tool == AnnoShape::Freehand) {
         AnnoPoint &last = app->draw_pts.back();
         if (std::hypot(app->draw_cur.x - last.x, app->draw_cur.y - last.y) >
@@ -1411,6 +1447,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
     auto *app = static_cast<App *>(appstate);
     if (app->tool.has_value() && *app->tool == AnnoShape::Text) {
       app->text_buffer += event->text.text;
+      app->overlay_dirty = true;
       std::println(stderr, "text-input: got='{}' len={} buffer='{}'",
                    event->text.text, app->text_buffer.size(),
                    app->text_buffer);
@@ -1434,16 +1471,19 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       app->tool.reset();
       app->drawing = false;
       app->text_buffer.clear();
+      app->overlay_dirty = true;
       std::println(stderr, "annotation tool: none");
     } else if (in_text && event->key.key == SDLK_RETURN) {
       std::println(stderr, "text: enter clears buffer '{}'", app->text_buffer);
       app->text_buffer.clear();
+      app->overlay_dirty = true;
       std::println(stderr, "annotation text: (cleared)");
     } else if (in_text && event->key.key == SDLK_BACKSPACE) {
       if (!app->text_buffer.empty()) {
         std::println(stderr, "text: backspace '{}' -> '{}'",
                      app->text_buffer.back(), app->text_buffer);
         app->text_buffer.pop_back();
+        app->overlay_dirty = true;
         std::println(stderr, "text: buffer now '{}'", app->text_buffer);
       }
     } else if (in_text) {
@@ -1493,6 +1533,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       app->tool = (app->tool.has_value() && *app->tool == shape)
                       ? std::nullopt
                       : std::optional(shape);
+      app->overlay_dirty = true;
       if (shape == AnnoShape::Text) {
         if (app->tool.has_value()) {
           SDL_StartTextInput(app->window);
@@ -1507,12 +1548,14 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
     } else if (event->key.key == SDLK_C) {
       app->color_idx = (app->color_idx + 1) %
                        (sizeof(kAnnoColors) / sizeof(kAnnoColors[0]));
+      app->overlay_dirty = true;
       std::println(stderr, "annotation color: {}", app->color_idx);
     } else if (event->key.key == SDLK_ESCAPE) {
       if (app->tool.has_value()) {
         app->tool.reset();
         app->drawing = false;
         app->text_buffer.clear();
+        app->overlay_dirty = true;
         std::println(stderr, "annotation tool: none");
       }
     } else if (event->key.key == SDLK_BACKSPACE) {
@@ -1520,6 +1563,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       if (id >= 0) {
         double t = anno_time(*app);
         app->annotations.remove_at(t, id);
+        app->overlay_dirty = true;
         std::println(stderr, "annotation: removed id={} at {:.2f}s", id, t);
       }
     } else if (event->key.key == SDLK_DELETE) {
@@ -1531,6 +1575,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       int id = app->annotations.hit_test(p, t);
       if (id >= 0) {
         app->annotations.remove_at(t, id);
+        app->overlay_dirty = true;
         std::println(stderr, "annotation: removed id={} at {:.2f}s", id, t);
       }
     }
