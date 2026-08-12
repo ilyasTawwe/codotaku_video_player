@@ -24,6 +24,7 @@ Prebuilt libraries are vendored under `external/`:
 
 - FFmpeg (`external/ffmpeg`)
 - libplacebo (`external/libplacebo`)
+- stb_truetype (`external/stb`, single public-domain header)
 
 System dependencies:
 
@@ -82,6 +83,9 @@ If no file is given, the player falls back to the bundled test clip
 main.cpp        SDL3 app: Vulkan device, libplacebo swapchain/renderer, event loop
 player.cpp/h    FFmpeg demux + decode (Vulkan hwaccel with software fallback)
 libav_impl.c    libplacebo <-> libav helpers (PL_LIBAV_IMPLEMENTATION)
+annotations.h   CPU rasterizer for drawing annotations over the video (text via
+                stb_truetype, system TTF font loaded at runtime)
+stb_truetype.cpp TU instantiating the vendored stb_truetype implementation
 CMakeLists.txt  Build: vendored deps on Windows, pkg-config on Linux
 tests/          Sample video (git-lfs)
 ```
@@ -97,4 +101,5 @@ licenses:
 - FFmpeg: GPL-3.0 (`external/ffmpeg/LICENSE`)
 - libplacebo: LGPL-2.1-or-later
 - SDL3: zlib license
+- stb_truetype: public domain / MIT (`external/stb/stb_truetype.h`)
 - Sample clip (`tests/`): Big Buck Bunny, CC-BY 3.0

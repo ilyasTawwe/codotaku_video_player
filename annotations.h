@@ -10,9 +10,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
+
+#include "external/stb/stb_truetype.h"
 
 struct AnnoPoint {
   float x = 0.0f;  // normalized 0..1, relative to the video frame width
@@ -263,7 +267,8 @@ struct AnnoRaster {
       }
   }
 
-  // 5x7 bitmap font: 7 rows per glyph, MSB of each row = leftmost column.
+  // 5x7 bitmap font (fallback glyphs): 7 rows per glyph, MSB of each row =
+  // leftmost column.
   static constexpr uint8_t kGlyph(char c) {
     switch (c) {
       case 'A': return 0;
@@ -402,7 +407,140 @@ struct AnnoRaster {
       {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // (space)
   };
 
+  // System TTF font for Text annotations, loaded lazily via stb_truetype.
+  // The font file bytes must outlive the stbtt_fontinfo, so both live together.
+  struct AnnoFont {
+    std::vector<uint8_t> data;
+    stbtt_fontinfo info{};
+    bool loaded = false;
+  } font_;
+
+  inline static constexpr const char *const kFontCandidates[] = {
+      // Windows
+      "C:\\Windows\\Fonts\\segoeui.ttf",
+      "C:\\Windows\\Fonts\\arial.ttf",
+      "C:\\Windows\\Fonts\\consola.ttf",
+      // Linux (Debian/Ubuntu, Fedora, Arch)
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+      "/usr/share/fonts/TTF/DejaVuSans.ttf",
+      // macOS
+      "/System/Library/Fonts/Supplemental/Arial.ttf",
+  };
+
+  bool load_font() {
+    if (font_.loaded)
+      return true;
+    for (const char *path : kFontCandidates) {
+      std::ifstream f(path, std::ios::binary);
+      if (!f)
+        continue;
+      f.seekg(0, std::ios::end);
+      std::streamoff size = f.tellg();
+      f.seekg(0, std::ios::beg);
+      if (size <= 0)
+        continue;
+      font_.data.resize(static_cast<size_t>(size));
+      f.read(reinterpret_cast<char *>(font_.data.data()),
+             static_cast<std::streamsize>(size));
+      if (!f) {  // short read: font file is unusable
+        font_.data.clear();
+        continue;
+      }
+      int offset = stbtt_GetFontOffsetForIndex(font_.data.data(), 0);
+      if (offset >= 0 &&
+          stbtt_InitFont(&font_.info, font_.data.data(), offset))
+        font_.loaded = true;
+      if (font_.loaded)
+        break;
+      font_.data.clear();
+    }
+    return font_.loaded;
+  }
+
+  // Decode the UTF-8 codepoint starting at `i`, advancing `i` past it.
+  static int utf8_next(const std::string &s, size_t &i) {
+    uint8_t b0 = static_cast<uint8_t>(s[i]);
+    if (b0 < 0x80) {
+      i += 1;
+      return b0;
+    }
+    int cp = 0;
+    size_t n = 0;
+    if ((b0 & 0xE0) == 0xC0) {
+      cp = b0 & 0x1F;
+      n = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+      cp = b0 & 0x0F;
+      n = 3;
+    } else if ((b0 & 0xF8) == 0xF0) {
+      cp = b0 & 0x07;
+      n = 4;
+    } else {
+      i += 1;  // stray continuation byte: pass through as-is
+      return b0;
+    }
+    if (i + n > s.size()) {
+      i += 1;
+      return b0;
+    }
+    for (size_t k = 1; k < n; k++) {
+      uint8_t b = static_cast<uint8_t>(s[i + k]);
+      if ((b & 0xC0) != 0x80) {
+        i += 1;
+        return b0;
+      }
+      cp = (cp << 6) | (b & 0x3F);
+    }
+    i += n;
+    return cp;
+  }
+
   void draw_text(const std::string &s, AnnoPoint pos, const float c[4]) {
+    if (s.empty())
+      return;
+    if (!load_font()) {
+      draw_text_bitmap(s, pos, c);
+      return;
+    }
+    int ascent = 0, descent = 0, linegap = 0;
+    stbtt_GetFontVMetrics(&font_.info, &ascent, &descent, &linegap);
+    // Scale so the cap height matches the old bitmap font (~5% of video
+    // height): stbtt_ScaleForPixelHeight targets (ascent - descent), so back
+    // that out to land on `ascent` pixels.
+    float scale =
+        stbtt_ScaleForPixelHeight(&font_.info,
+                                  vh * 0.05f * (ascent - descent) / ascent);
+    float baseline = py(pos) + ascent * scale;
+    float pen_x = px(pos);
+    int prev_cp = 0;
+    for (size_t i = 0; i < s.size();) {
+      int cp = utf8_next(s, i);
+      int advance = 0, lsb = 0;
+      stbtt_GetCodepointHMetrics(&font_.info, cp, &advance, &lsb);
+      if (prev_cp != 0)
+        pen_x += stbtt_GetCodepointKernAdvance(&font_.info, prev_cp, cp) * scale;
+      if (cp != ' ') {
+        int w = 0, h = 0, xoff = 0, yoff = 0;
+        unsigned char *glyph = stbtt_GetCodepointBitmap(
+            &font_.info, scale, scale, cp, &w, &h, &xoff, &yoff);
+        if (glyph != nullptr) {
+          int gx0 = static_cast<int>(std::lround(pen_x + xoff));
+          int gy0 = static_cast<int>(std::lround(baseline + yoff));
+          for (int gy = 0; gy < h; gy++)
+            for (int gx = 0; gx < w; gx++)
+              blend_px(gx0 + gx, gy0 + gy, c, glyph[gy * w + gx] / 255.0f);
+          std::free(glyph);  // stb's default allocator is malloc/free
+        }
+      }
+      pen_x += advance * scale;
+      prev_cp = cp;
+    }
+  }
+
+  // 5x7 bitmap font fallback (used only when no system TTF font is found):
+  // 7 rows per glyph, MSB of each row = leftmost column.
+  void draw_text_bitmap(const std::string &s, AnnoPoint pos, const float c[4]) {
     if (s.empty())
       return;
     int scale = std::max(1, static_cast<int>(std::llround(vh * 0.05f / 7.0f)));
@@ -410,6 +548,8 @@ struct AnnoRaster {
     int origin_y = static_cast<int>(std::lround(py(pos)));
     int pen_x = origin_x;
     for (unsigned char ch : s) {
+      if (ch >= 128)  // the bitmap font is ASCII-only
+        ch = '?';
       unsigned char u = static_cast<unsigned char>(std::toupper(ch));
       const uint8_t *g = kFont[kGlyph(static_cast<char>(u))];
       for (int row = 0; row < 7; row++) {

@@ -16,7 +16,7 @@ if(UNIX AND NOT APPLE)
     pkg_check_modules(PLACEBO REQUIRED IMPORTED_TARGET libplacebo)
     pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
 
-    add_executable(codotaku_video_player main.cpp player.cpp libav_impl.c)
+    add_executable(codotaku_video_player main.cpp player.cpp libav_impl.c stb_truetype.cpp)
     target_link_libraries(codotaku_video_player PRIVATE
         PkgConfig::FFMPEG
         PkgConfig::PLACEBO
@@ -71,7 +71,7 @@ else()
         target_link_libraries(Placebo::placebo INTERFACE Vulkan::Headers)
     endif()
 
-    add_executable(codotaku_video_player main.cpp player.cpp libav_impl.c)
+    add_executable(codotaku_video_player main.cpp player.cpp libav_impl.c stb_truetype.cpp)
     target_link_libraries(codotaku_video_player PRIVATE
         FFmpeg::avformat
         FFmpeg::avcodec
