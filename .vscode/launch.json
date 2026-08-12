@@ -9,7 +9,7 @@
       "args": [
         "--shader",
         "${workspaceFolder}/out/build/default/packs/Anime4K/glsl/Upscale/Anime4K_Upscale_CNN_x2_VL.glsl",
-        "${workspaceFolder}/tests/bbb_15s.mp4"
+        "${workspaceFolder}/tests/bbb_sunflower_1080p_60fps_normal.mp4"
       ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
@@ -19,7 +19,22 @@
       "type": "lldb",
       "request": "launch",
       "program": "${workspaceFolder}/out/build/default/codotaku_video_player.exe",
-      "args": ["${workspaceFolder}/tests/bbb_15s.mp4"],
+      "args": [
+        "${workspaceFolder}/tests/bbb_sunflower_1080p_60fps_normal.mp4"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Play (greyscale test)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/default/codotaku_video_player.exe",
+      "args": [
+        "--shader",
+        "${workspaceFolder}/out/build/default/shaders/greyscale.glsl",
+        "${workspaceFolder}/tests/bbb_sunflower_1080p_60fps_normal.mp4"
+      ],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
     }

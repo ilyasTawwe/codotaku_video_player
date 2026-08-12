@@ -1,5 +1,6 @@
 #include "player.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <format>
 #include <print>
@@ -432,18 +433,36 @@ AVFrame *Player::take_audio_frame() {
   return af;
 }
 
-void Player::rewind() {
+double Player::duration() const {
+  if (info_.duration_us > 0)
+    return info_.duration_us / 1e6;
+  if (fmt_ != nullptr && fmt_->duration != AV_NOPTS_VALUE && fmt_->duration > 0)
+    return static_cast<double>(fmt_->duration) / AV_TIME_BASE;
+  return 0.0;
+}
+
+void Player::seek_to(double seconds) {
   if (fmt_ == nullptr)
     return;
 
-  // Both worker threads have normally exited at EOF; stop_demux/stop_adec
-  // are safe no-ops then. If an audio frame send is still blocked on a full
-  // queue, err_send unblocks it so the join can't deadlock.
+  double dur = duration();
+  if (dur > 0.0)
+    seconds = std::clamp(seconds, 0.0, dur);
+
+  // Stop both worker threads, unblocking any send/recv stuck on a full/empty
+  // queue so the joins can't deadlock mid-playback (at EOF the threads have
+  // already exited, so these are no-ops then).
+  interrupt_.abort = 1;
+  for (AVThreadMessageQueue *q : {video_q_, audio_q_, audio_frame_q_}) {
+    if (q == nullptr)
+      continue;
+    av_thread_message_queue_set_err_send(q, AVERROR_EXIT);
+    av_thread_message_queue_set_err_recv(q, AVERROR_EXIT);
+  }
   stop_demux();
-  if (audio_frame_q_ != nullptr)
-    av_thread_message_queue_set_err_send(audio_frame_q_, AVERROR_EXIT);
   stop_adec();
 
+  // Drop everything decoded/demuxed before the seek.
   for (AVThreadMessageQueue **q : {&video_q_, &audio_q_, &audio_frame_q_}) {
     if (*q == nullptr)
       continue;
@@ -452,9 +471,18 @@ void Player::rewind() {
     av_thread_message_queue_set_err_recv(*q, 0);
   }
 
-  int ret = av_seek_frame(fmt_, stream_, 0, AVSEEK_FLAG_BACKWARD);
-  if (ret < 0)
+  AVStream *st = fmt_->streams[stream_];
+  int64_t seek_ts = av_rescale_q(static_cast<int64_t>(seconds * AV_TIME_BASE),
+                                 AV_TIME_BASE_Q, st->time_base);
+  int ret = av_seek_frame(fmt_, stream_, seek_ts, AVSEEK_FLAG_BACKWARD);
+  if (ret < 0) {
+    // Get playback moving again before propagating the error.
+    start_demux();
+    if (info_.has_audio)
+      start_adec();
     throw_av(ret);
+  }
+
   avcodec_flush_buffers(dec_);
   if (adec_ != nullptr)
     avcodec_flush_buffers(adec_);
@@ -466,3 +494,5 @@ void Player::rewind() {
   if (info_.has_audio)
     start_adec();
 }
+
+void Player::rewind() { seek_to(0.0); }

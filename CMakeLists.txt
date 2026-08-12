@@ -126,4 +126,14 @@ if(WIN32)
             )
         endif()
     endforeach()
+
+    # First-party shaders under shaders/ (e.g. the greyscale test).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+        add_custom_command(TARGET codotaku_video_player POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+            "$<TARGET_FILE_DIR:codotaku_video_player>/shaders"
+            COMMENT "Copying project shaders to output directory..."
+        )
+    endif()
 endif()

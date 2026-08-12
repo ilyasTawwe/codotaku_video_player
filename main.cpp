@@ -107,6 +107,9 @@ struct App {
   double frame_timer = 0.0;  // wall time when the current frame is due
   double prev_frame_pts = NAN;
   bool paused = false;
+  // When a seek lands while paused, one frame is decoded and shown so the new
+  // position is visible without resuming playback.
+  bool pending_seek_redraw = false;
 };
 
 auto append_ext(std::string &buf, const char *ext) -> void {
@@ -404,6 +407,21 @@ auto render_frame(App &app, AVFrame *frame) -> SDL_AppResult {
   return SDL_APP_CONTINUE;
 }
 
+// Seek the player to a media time and reset all playback clocks/state so the
+// next frame decoded is the one at (or just before) the target. When paused,
+// a single frame is rendered so the new position becomes visible.
+auto seek_app(App &app, double seconds) -> void {
+  app.player.seek_to(seconds);
+  app.frame_timer = 0.0;
+  app.prev_frame_pts = NAN;
+  app.vidclk = MediaClock{};
+  if (app.audio_stream != nullptr)
+    SDL_ClearAudioStream(app.audio_stream);
+  app.audio_pts_end = 0.0;
+  app.pending_seek_redraw = app.paused;
+  std::println(stderr, "seek: {:.2f}s", seconds);
+}
+
 // Convert one decoded audio frame to SDL and queue it on the output stream.
 // SDL handles sample-rate, channel, and format conversion internally.
 auto push_audio(App &app, AVFrame *frame) -> void {
@@ -554,7 +572,23 @@ auto SDL_AppIterate(void *appstate) -> SDL_AppResult try {
   auto *app = static_cast<App *>(appstate);
 
   if (app->paused) {
-    SDL_Delay(16);
+    if (app->pending_seek_redraw) {
+      // Show the frame at the seek target without resuming playback.
+      app->pending_seek_redraw = false;
+      AVFrame *frame = app->player.next_frame();
+      if (frame != nullptr) {
+        render_frame(*app, frame);
+        double pts = frame_pts_s(app->player, frame);
+        if (!std::isnan(pts)) {
+          clock_set(app->vidclk, pts, 0);
+          app->vidclk.paused = true;
+        }
+        app->prev_frame_pts = pts;
+        av_frame_free(&frame);
+      }
+    } else {
+      SDL_Delay(16);
+    }
     return SDL_APP_CONTINUE;
   }
 
@@ -677,6 +711,21 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       pl_swapchain_resize(app->swapchain, &w, &h);
     break;
   }
+  case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    if (event->button.button == SDL_BUTTON_LEFT) {
+      auto *app = static_cast<App *>(appstate);
+      double dur = app->player.duration();
+      if (dur <= 0.0) {
+        std::println(stderr, "seek: duration unknown");
+        break;
+      }
+      int w = 0;
+      int h = 0;
+      if (!SDL_GetWindowSizeInPixels(app->window, &w, &h) || w <= 0)
+        break;
+      seek_app(*app, dur * static_cast<double>(event->button.x) / w);
+    }
+    break;
   case SDL_EVENT_KEY_DOWN: {
     auto *app = static_cast<App *>(appstate);
     if (event->key.key == SDLK_SPACE) {
@@ -701,6 +750,11 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         std::println(stderr, "shaders: {} ({} loaded)",
                      app->shaders_enabled ? "on" : "off", app->hooks.size());
       }
+    } else if (event->key.key == SDLK_LEFT || event->key.key == SDLK_RIGHT) {
+      double t = clock_get(app->vidclk);
+      if (std::isnan(t))
+        t = 0.0;
+      seek_app(*app, t + (event->key.key == SDLK_LEFT ? -10.0 : 10.0));
     }
     break;
   }

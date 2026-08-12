@@ -62,6 +62,14 @@ public:
   // Seek back to the start and resume decoding (for looping).
   void rewind();
 
+  // Seek to a media time in seconds (clamped to [0, duration]). Throws
+  // std::runtime_error on failure. Worker threads are torn down and restarted,
+  // so packets/frames in flight from before the seek are discarded.
+  void seek_to(double seconds);
+
+  // Media duration in seconds, or 0 when unknown (some containers omit it).
+  double duration() const;
+
   bool eof() const { return eof_; }
   const PlayerInfo &info() const { return info_; }
   AVRational time_base() const { return info_.time_base; }
