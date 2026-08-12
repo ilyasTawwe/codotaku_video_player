@@ -150,6 +150,15 @@ struct App {
   // consumes it to re-blend the overlay onto the last composited video frame.
   bool overlay_dirty = false;
 
+  // --- Seek ---------------------------------------------------------------
+  // While the left button is held on the progress bar with no tool active we
+  // scrub continuously instead of only seeking on click. Ctrl+press captures
+  // an anchor (media time at key-down) and remaps the bar to ±kFineSeekWindow
+  // around it until Ctrl is released.
+  bool scrubbing = false;
+  bool fine_seek = false;
+  double fine_seek_anchor = 0.0;
+
   // --- Export -------------------------------------------------------------
   // The exporter is non-null while an export is running; SDL_AppIterate then
   // drives decode/encode exclusively (no playback pacing or audio output).
@@ -215,6 +224,12 @@ constexpr double kSyncThresholdMax = 0.1;
 constexpr double kSyncFramedupThreshold = 0.1;
 constexpr double kNoSyncThreshold = 10.0;    // above this drift, don't correct
 constexpr double kMaxFrameDuration = 3600.0; // pts gap this large is a discontinuity
+
+// Seek steps: plain ←/→ jumps 10s; Ctrl+←/→ steps 1s. Ctrl+click remaps the
+// whole-video progress bar to this window centered on the current position.
+constexpr double kSeekStep = 10.0;
+constexpr double kFineSeekStep = 1.0;
+constexpr double kFineSeekWindow = 10.0;
 
 // How long the next frame should stay on screen, adjusted to pull the video
 // clock back toward the master (audio) clock.
@@ -1197,6 +1212,28 @@ auto seek_app(App &app, double seconds) -> void {
   std::println(stderr, "seek: {:.2f}s", seconds);
 }
 
+// Map a window x coordinate to a media time and seek there. With Ctrl held
+// (fine seek) the bar spans ±kFineSeekWindow around the anchor captured at
+// Ctrl-press; otherwise it spans the whole video.
+auto seek_from_bar_x(App &app, float x) -> void {
+  double dur = app.player.duration();
+  if (dur <= 0.0) {
+    std::println(stderr, "seek: duration unknown");
+    return;
+  }
+  int w = 0;
+  int h = 0;
+  if (!SDL_GetWindowSizeInPixels(app.window, &w, &h) || w <= 0)
+    return;
+  double frac = std::clamp(static_cast<double>(x) / w, 0.0, 1.0);
+  if (app.fine_seek) {
+    double target = app.fine_seek_anchor + (frac - 0.5) * 2.0 * kFineSeekWindow;
+    seek_app(app, target);
+  } else {
+    seek_app(app, dur * frac);
+  }
+}
+
 // Convert one decoded audio frame to SDL and queue it on the output stream.
 // SDL handles sample-rate, channel, and format conversion internally.
 auto push_audio(App &app, AVFrame *frame) -> void {
@@ -1547,16 +1584,10 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         app->overlay_dirty = true;
       }
     } else {
-      double dur = app->player.duration();
-      if (dur <= 0.0) {
-        std::println(stderr, "seek: duration unknown");
-        break;
-      }
-      int w = 0;
-      int h = 0;
-      if (!SDL_GetWindowSizeInPixels(app->window, &w, &h) || w <= 0)
-        break;
-      seek_app(*app, dur * static_cast<double>(event->button.x) / w);
+      // Scrub seek: hold the left button and drag on the bar. This also
+      // handles the plain click case (down = seek to that point).
+      app->scrubbing = true;
+      seek_from_bar_x(*app, event->button.x);
     }
     break;
   }
@@ -1588,6 +1619,7 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         }
       }
     }
+    app->scrubbing = false;
     break;
   }
   case SDL_EVENT_MOUSE_MOTION: {
@@ -1610,6 +1642,10 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
             0.002f)
           app->draw_pts.push_back(app->draw_cur);
       }
+    } else if (app->scrubbing) {
+      // Drag on the progress bar seeks continuously; with Ctrl held this uses
+      // the anchor captured at Ctrl-press (see seek_from_bar_x).
+      seek_from_bar_x(*app, event->motion.x);
     } else if (app->tool.has_value() && *app->tool == AnnoShape::Text &&
                !app->text_buffer.empty()) {
       // Keep the text preview anchored to the cursor.
@@ -1634,6 +1670,19 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       // While exporting, swallow all input except Esc (cancel).
       if (event->key.key == SDLK_ESCAPE)
         cancel_export(*app);
+      break;
+    }
+    if (event->key.key == SDLK_LCTRL || event->key.key == SDLK_RCTRL) {
+      // Capture the anchor for fine seeking once per Ctrl press (guard against
+      // key-repeat re-anchoring). The bar is remapped around this media time
+      // until Ctrl is released, so dragging stays stable while video plays.
+      if (!app->fine_seek) {
+        app->fine_seek = true;
+        double anchor = clock_get(app->vidclk);
+        app->fine_seek_anchor = std::isnan(anchor) ? 0.0 : anchor;
+        std::println(stderr, "fine seek: anchor {:.2f}s",
+                     app->fine_seek_anchor);
+      }
       break;
     }
     const bool in_text =
@@ -1691,7 +1740,10 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
       double t = clock_get(app->vidclk);
       if (std::isnan(t))
         t = 0.0;
-      seek_app(*app, t + (event->key.key == SDLK_LEFT ? -10.0 : 10.0));
+      // Ctrl turns the coarse ±10s jumps into fine ±1s steps.
+      double step = (event->key.mod & SDL_KMOD_CTRL) ? kFineSeekStep
+                                                     : kSeekStep;
+      seek_app(*app, t + (event->key.key == SDLK_LEFT ? -step : step));
     } else if (event->key.key == SDLK_R || event->key.key == SDLK_E ||
                event->key.key == SDLK_A || event->key.key == SDLK_F ||
                event->key.key == SDLK_T) {
@@ -1763,6 +1815,18 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
         app->annotations.remove_at(t, id);
         app->overlay_dirty = true;
         std::println(stderr, "annotation: removed id={} at {:.2f}s", id, t);
+      }
+    }
+    break;
+  }
+  case SDL_EVENT_KEY_UP: {
+    auto *app = static_cast<App *>(appstate);
+    if (event->key.key == SDLK_LCTRL || event->key.key == SDLK_RCTRL) {
+      // Release the fine-seek anchor; the bar reverts to spanning the whole
+      // video on the next scrub/click.
+      if (app->fine_seek) {
+        app->fine_seek = false;
+        std::println(stderr, "fine seek: released");
       }
     }
     break;
