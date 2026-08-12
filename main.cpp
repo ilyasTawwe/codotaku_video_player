@@ -637,7 +637,7 @@ auto blend_overlay(App &app, pl_tex target) -> void {
     if (a.visible_at(t))
       app.raster.draw_annotation(a);
 
-  if (app.drawing && app.tool.has_value()) {
+  if (app.tool.has_value()) {
     Annotation preview{};
     preview.shape = *app.tool;
     const float *c = anno_color(app);
@@ -645,11 +645,24 @@ auto blend_overlay(App &app, pl_tex target) -> void {
     preview.color[1] = c[1];
     preview.color[2] = c[2];
     preview.color[3] = 0.6f;
-    preview.pts = *app.tool == AnnoShape::Freehand
-                      ? app.draw_pts
-                      : std::vector<AnnoPoint>{app.draw_anchor, app.draw_cur};
-    preview.text = app.text_buffer;
-    app.raster.draw_annotation(preview);
+    if (*app.tool == AnnoShape::Text) {
+      // Live preview of the pending text at the mouse cursor, where the
+      // next click will place it.
+      if (!app.text_buffer.empty()) {
+        float mx = 0.0f;
+        float my = 0.0f;
+        SDL_GetMouseState(&mx, &my);
+        preview.pts = {window_to_anno(app, mx, my)};
+        preview.text = app.text_buffer;
+        app.raster.draw_annotation(preview);
+      }
+    } else if (app.drawing) {
+      preview.pts = *app.tool == AnnoShape::Freehand
+                        ? app.draw_pts
+                        : std::vector<AnnoPoint>{app.draw_anchor, app.draw_cur};
+      preview.text = app.text_buffer;
+      app.raster.draw_annotation(preview);
+    }
   }
 
   run_overlay_blend(app, app.blend_pass, app.video_tex, app.overlay_tex,
@@ -1440,6 +1453,10 @@ auto SDL_AppEvent(void *appstate, SDL_Event *event) -> SDL_AppResult try {
             0.002f)
           app->draw_pts.push_back(app->draw_cur);
       }
+    } else if (app->tool.has_value() && *app->tool == AnnoShape::Text &&
+               !app->text_buffer.empty()) {
+      // Keep the text preview anchored to the cursor.
+      app->overlay_dirty = true;
     }
     break;
   }
